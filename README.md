@@ -6,55 +6,56 @@ System tray meeting recorder with automatic transcription and AI-generated notes
 
 1. **Install dependencies**
    ```
-   pip install pystray pillow python-dotenv pydub soundcard soundfile scipy assemblyai anthropic
-   pip install git+https://github.com/bastibe/SoundCard.git  # use git version, not PyPI
+   pip install pystray pillow python-dotenv pydub soundfile scipy assemblyai anthropic
+   pip install git+https://github.com/bastibe/SoundCard.git
    ```
 
 2. **Configure API keys**
    ```
    copy .env.example .env
    ```
-   Then edit `.env` and fill in your keys:
+   Edit `.env`:
    ```
-   ASSEMBLYAI_API_KEY=your_assemblyai_key_here
-   ANTHROPIC_API_KEY=your_anthropic_key_here
+   ASSEMBLYAI_API_KEY=your_key_here
+   ANTHROPIC_API_KEY=your_key_here
    ```
 
 3. **Run**
    ```
    pythonw tray.py
    ```
-   Use `pythonw` instead of `python` to run without a console window.
-
-## Usage
-
-Right-click the tray icon (bottom-right taskbar) to:
-
-- **▶ Start Recording** – begins capturing mic + system audio
-- **⏹ Stop Recording** – stops and saves the MP3
-- **📝 Transcribe & Notes** – sends to AssemblyAI + Claude, opens notes when done
-- **📁 Open Records Folder** – opens the `records/` folder in Explorer
-
-The tray icon changes colour:
-- 🟢 Green = idle
-- 🔴 Red = recording (tooltip shows duration)
-- 🟡 Yellow = processing transcript
 
 ## Files
 
 ```
 meetrec/
-├── tray.py          # Main entry point – run this
-├── recorder.py      # Audio capture logic
-├── transcriber.py   # AssemblyAI + Claude pipeline
-├── .env             # Your API keys (never commit this)
-├── .env.example     # Template
-└── records/         # All recordings, transcripts and notes saved here
+├── tray.py            # Entry point – run this
+├── recorder.py        # Audio capture
+├── transcriber.py     # AssemblyAI + Claude pipeline
+├── context_dialog.py  # Meeting details dialog
+├── logger.py          # Logging setup
+├── .env               # API keys (never commit)
+├── .env.example       # Template
+└── records/
+    ├── audio/         # MP3 recordings
+    ├── transcripts/   # _transcript.txt files
+    ├── notes/         # _notes.md files
+    └── meetrec.log    # Application log
 ```
+
+## Tray menu
+
+| Item | Description |
+|------|-------------|
+| ▶ Start / ⏹ Stop Recording | Toggle recording |
+| 📝 Transcribe & Notes | Process last recording |
+| 📂 Transcribe a file… | Pick any MP3 to transcribe |
+| 🔁 Auto-transcribe | Automatically transcribe after every recording |
+| 🎙️ Microphone | Select input device |
+| 🔊 Loopback | Select system audio source |
+| 📋 Open log | View meetrec.log |
 
 ## Auto-start with Windows
 
-To have MeetRec start with Windows:
-1. Press `Win+R`, type `shell:startup`
-2. Create a shortcut to `tray.py` there
-3. In the shortcut properties, set "Target" to: `pythonw.exe C:\tools\meetrec\tray.py`
+1. Press `Win+R` → `shell:startup`
+2. Create a shortcut with target: `pythonw.exe C:\tools\meetrec\tray.py`
