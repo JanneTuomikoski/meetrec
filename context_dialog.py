@@ -120,7 +120,7 @@ class MeetingContext:
     participants: str = ""
     agenda:       str = ""
     language:     str = ""
-
+    notes_language: str = "en" 
 
 class ContextDialog(QDialog):
     def __init__(self, default_title: str = ""):
@@ -135,10 +135,6 @@ class ContextDialog(QDialog):
         suffix = "  <span style='color:#585b70;font-weight:400;text-transform:none'>optional</span>" if optional else ""
         lbl = QLabel(f"{text}{suffix}")
         lbl.setTextFormat(Qt.RichText)
-        font = QFont()
-        font.setPointSize(8)
-        font.setWeight(QFont.DemiBold)
-        lbl.setFont(font)
         lbl.setStyleSheet("color: #a6adc8; letter-spacing: 0.5px;")
         return lbl
 
@@ -207,7 +203,17 @@ class ContextDialog(QDialog):
         root.addWidget(self.lang_combo)
         root.addSpacing(20)
 
+        # ── Notes language ──
+        root.addSpacing(12)
+        root.addWidget(self._field_label("NOTES LANGUAGE"))
+        self.notes_lang_combo = QComboBox()
+        self.notes_lang_combo.addItem("English", "en")
+        self.notes_lang_combo.addItem("Finnish", "fi")
+        self.notes_lang_combo.setFixedHeight(38)
+        root.addWidget(self.notes_lang_combo)
+
         # ── Buttons ──
+        root.addSpacing(12)
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
 
@@ -239,6 +245,7 @@ class ContextDialog(QDialog):
             participants = self.participants_input.text().strip(),
             agenda       = self.agenda_input.toPlainText().strip(),
             language     = self.lang_combo.currentData(),
+            notes_language = self.notes_lang_combo.currentData(),
         )
         self.accept()
 

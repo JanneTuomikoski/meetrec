@@ -56,6 +56,8 @@ def transcribe_with_speakers(mp3_path: str, language: str = "") -> str:
 def generate_notes(raw_text: str, context=None) -> str:
     log.info("Generating notes with Claude")
 
+    notes_lang = "Finnish" if (context and context.notes_language == "fi") else "English"
+
     context_block = ""
     if context:
         parts = []
@@ -74,7 +76,7 @@ def generate_notes(raw_text: str, context=None) -> str:
         max_tokens=2000,
         messages=[{
             "role": "user",
-            "content": f"""You are an expert meeting note-taker. Analyze this meeting transcript and produce:
+            "content": f"""You are an expert meeting note-taker. Write all notes in {notes_lang}. Analyze this meeting transcript and produce:
 
 1. **Meeting Summary** – 3-5 sentence overview
 2. **Key Discussion Points** – bullet list of main topics
