@@ -2,17 +2,22 @@
 MeetRec - System tray meeting recorder
 Run with: pythonw tray.py
 """
+import pythoncom
+pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
 
+import sys
 import threading
 import time
 import os
 import subprocess
 from pathlib import Path
-from PySide6.QtWidgets import QApplication, QFileDialog
 
 import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageDraw
+
+from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtCore import QObject, Signal, QTimer, Qt
 
 from recorder import Recorder, list_microphones, list_speakers
 from transcriber import process_meeting
@@ -29,13 +34,14 @@ for d in (AUDIO_DIR, TRANSCRIPT_DIR, NOTES_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 # ── State ──────────────────────────────────────────────────────────────────
-recorder       = Recorder(str(AUDIO_DIR))
-_tray_icon     = None
-_status        = "idle"   # idle | recording | processing
-_start_time    = None
-_last_mp3      = None
+recorder         = Recorder(str(AUDIO_DIR))
+_tray_icon       = None
+_bridge          = None
+_status          = "idle"   # idle | recording | processing
+_start_time      = None
+_last_mp3        = None
 _auto_transcribe = False
-_stop_tooltip  = threading.Event()
+_stop_tooltip    = threading.Event()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -96,24 +102,66 @@ def notify(title: str, message: str):
     )
 
 
-# ── Transcribe pipeline (shared) ───────────────────────────────────────────
+# ── UI Bridge — all Qt dialogs must run on the main thread ─────────────────
 
-def _run_transcribe(mp3_path: str, icon):
-    """Show context dialog, then run transcription. Called from a thread."""
+class UIBridge(QObject):
+    """Receives signals from tray/worker threads and runs Qt UI on main thread."""
+
+    _request_file_pick   = Signal()
+    _request_context     = Signal(str)   # mp3 path
+
+    def __init__(self):
+        super().__init__()
+        self._request_file_pick.connect(self._do_file_pick)
+        self._request_context.connect(self._do_show_context)
+
+    # Called from any thread — safely
+    def open_file_and_transcribe(self):
+        self._request_file_pick.emit()
+
+    def show_context_and_transcribe(self, mp3_path: str):
+        self._request_context.emit(mp3_path)
+
+    # ── Runs on main thread ──
+
+    def _do_file_pick(self):
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Select a recording to transcribe",
+            str(AUDIO_DIR),
+            "MP3 files (*.mp3);;All files (*.*)",
+        )
+        if path:
+            self._do_show_context(path)
+
+    def _do_show_context(self, mp3_path: str):
+        global _status
+        stem    = Path(mp3_path).stem.replace("meeting_", "").replace("_", " ")
+        context = ask_meeting_context(default_title=stem)
+
+        if context is None:
+            log.info("Transcription cancelled by user.")
+            _status = "idle"
+            if _tray_icon:
+                _tray_icon.icon = make_icon("idle")
+                _tray_icon.update_menu()
+            return
+
+        # Set processing state before handing off to worker thread
+        _status = "processing"
+        if _tray_icon:
+            _tray_icon.icon = make_icon("processing")
+            _tray_icon.update_menu()
+
+        threading.Thread(
+            target=_pipeline, args=(mp3_path, context), daemon=True
+        ).start()
+
+
+# ── Transcription pipeline (worker thread) ─────────────────────────────────
+
+def _pipeline(mp3_path: str, context):
     global _status
-
-    # Derive a default title from filename timestamp
-    stem = Path(mp3_path).stem.replace("meeting_", "").replace("_", " ")
-    context = ask_meeting_context(default_title=stem)
-
-    if context is None:
-        # User clicked Cancel — abort
-        log.info("Transcription cancelled by user.")
-        _status = "idle"
-        icon.icon = make_icon("idle")
-        icon.update_menu()
-        return
-
     try:
         notes_file = process_meeting(
             mp3_path,
@@ -129,8 +177,9 @@ def _run_transcribe(mp3_path: str, icon):
         notify("MeetRec", f"❌ Processing failed: {e}")
     finally:
         _status = "idle"
-        icon.icon = make_icon("idle")
-        icon.update_menu()
+        if _tray_icon:
+            _tray_icon.icon = make_icon("idle")
+            _tray_icon.update_menu()
 
 
 # ── Recording actions ──────────────────────────────────────────────────────
@@ -166,7 +215,7 @@ def stop_recording(icon, _item):
         _status = "processing"
         icon.icon = make_icon("processing")
         icon.update_menu()
-        threading.Thread(target=_run_transcribe, args=(mp3, icon), daemon=True).start()
+        _bridge.show_context_and_transcribe(mp3)
     else:
         notify("MeetRec", "Recording saved.\nUse menu to transcribe.")
 
@@ -178,30 +227,13 @@ def transcribe_last(icon, _item):
     _status = "processing"
     icon.icon = make_icon("processing")
     icon.update_menu()
-    threading.Thread(target=_run_transcribe, args=(_last_mp3, icon), daemon=True).start()
+    _bridge.show_context_and_transcribe(_last_mp3)
 
 
 def transcribe_file(icon, _item):
-    """Open a file picker and transcribe any MP3."""
-    global _status
     if _status != "idle":
         return
-
-    app = QApplication.instance() or QApplication([])
-    path, _ = QFileDialog.getOpenFileName(
-        None,
-        "Select a recording to transcribe",
-        str(AUDIO_DIR),
-        "MP3 files (*.mp3);;All files (*.*)",
-    )
-
-    if not path:
-        return
-
-    _status = "processing"
-    icon.icon = make_icon("processing")
-    icon.update_menu()
-    threading.Thread(target=_run_transcribe, args=(path, icon), daemon=True).start()
+    _bridge.open_file_and_transcribe()
 
 
 def toggle_auto_transcribe(icon, _item):
@@ -267,18 +299,19 @@ def on_quit(icon, _item):
     if _status == "recording":
         recorder.stop()
     icon.stop()
+    QApplication.instance().quit()
 
 
 # ── Menu ───────────────────────────────────────────────────────────────────
 
 def build_menu():
     return pystray.Menu(
-        item("▶  Start Recording",   start_recording, enabled=lambda _: _status == "idle"),
-        item("⏹  Stop Recording",    stop_recording,  enabled=lambda _: _status == "recording"),
+        item("▶  Start Recording",      start_recording, enabled=lambda _: _status == "idle"),
+        item("⏹  Stop Recording",       stop_recording,  enabled=lambda _: _status == "recording"),
         pystray.Menu.SEPARATOR,
-        item("📝  Transcribe & Notes",  transcribe_last,
+        item("📝  Transcribe & Notes",   transcribe_last,
              enabled=lambda _: _status == "idle" and bool(_last_mp3)),
-        item("📂  Transcribe a file…",  transcribe_file,
+        item("📂  Transcribe a file…",   transcribe_file,
              enabled=lambda _: _status == "idle"),
         item(lambda _: f"🔁  Auto-transcribe  {'✔' if _auto_transcribe else ''}",
              toggle_auto_transcribe),
@@ -286,10 +319,10 @@ def build_menu():
         item("🎙️  Microphone",  pystray.Menu(mic_submenu)),
         item("🔊  Loopback",    pystray.Menu(spk_submenu)),
         pystray.Menu.SEPARATOR,
-        item("📁  Audio folder",       open_folder(AUDIO_DIR)),
-        item("📄  Transcripts folder", open_folder(TRANSCRIPT_DIR)),
-        item("🗒️  Notes folder",       open_folder(NOTES_DIR)),
-        item("📋  Open log",           lambda i, _: os.startfile(str(BASE_DIR / "records" / "meetrec.log"))),
+        item("📁  Audio folder",        open_folder(AUDIO_DIR)),
+        item("📄  Transcripts folder",  open_folder(TRANSCRIPT_DIR)),
+        item("🗒️  Notes folder",        open_folder(NOTES_DIR)),
+        item("📋  Open log",            lambda i, _: os.startfile(str(BASE_DIR / "records" / "meetrec.log"))),
         pystray.Menu.SEPARATOR,
         item("Quit", on_quit),
     )
@@ -298,7 +331,17 @@ def build_menu():
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    global _tray_icon
+    global _tray_icon, _bridge
+
+    # Qt must own the main thread
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    # Force non-native dialogs to avoid COM threading conflicts with pystray
+    app.setAttribute(Qt.AA_DontUseNativeDialogs, True)
+
+    _bridge = UIBridge()
+
     log.info("MeetRec started")
     _tray_icon = pystray.Icon(
         "meetrec",
@@ -306,7 +349,11 @@ def main():
         "MeetRec – Idle",
         menu=build_menu(),
     )
-    _tray_icon.run()
+
+    # pystray runs in a background thread; Qt event loop owns main thread
+    threading.Thread(target=_tray_icon.run, daemon=True).start()
+
+    app.exec()
 
 
 if __name__ == "__main__":
