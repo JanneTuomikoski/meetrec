@@ -5,10 +5,18 @@ API keys loaded from .env. Accepts optional MeetingContext for richer notes.
 """
 
 import os
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
 import assemblyai as aai
+from assemblyai.streaming.v3 import (
+    StreamingClient,
+    StreamingClientOptions,
+    StreamingParameters,
+    SpeechModel,
+    StreamingEvents,
+)
 import anthropic
 
 from logger import log
@@ -94,6 +102,64 @@ Transcript:
     notes = response.content[0].text
     log.info("Notes generated successfully")
     return notes
+
+
+class RealtimeTranscriptionSession:
+    """Streams PCM audio to AssemblyAI (v3) in real time and accumulates the transcript."""
+
+    def __init__(self, on_partial=None, on_final=None):
+        self.on_partial = on_partial   # Callable[[str], None]
+        self.on_final   = on_final     # Callable[[str], None]
+        self._finals: list[str] = []
+        self._client  = None
+        self._connected = threading.Event()
+
+    def start(self, sample_rate: int = 16000):
+        options = StreamingClientOptions(api_key=ASSEMBLYAI_API_KEY)
+        self._client = StreamingClient(options=options)
+
+        def _on_begin(_client, event):
+            self._connected.set()
+            log.info(f"Streaming session started: {event.id}")
+
+        def _on_turn(_client, event):
+            if not event.transcript:
+                return
+            if event.end_of_turn:
+                # Skip if identical to the previous final (API occasionally re-emits)
+                if not self._finals or self._finals[-1] != event.transcript:
+                    self._finals.append(event.transcript)
+                    if self.on_final:
+                        self.on_final(event.transcript)
+            else:
+                if self.on_partial:
+                    self.on_partial(event.transcript)
+
+        def _on_error(_client, error):
+            log.error(f"RealtimeTranscriber error: {error}")
+
+        self._client.on(StreamingEvents.Begin, _on_begin)
+        self._client.on(StreamingEvents.Turn,  _on_turn)
+        self._client.on(StreamingEvents.Error, _on_error)
+
+        params = StreamingParameters(
+            sample_rate=sample_rate,
+            speech_model=SpeechModel.u3_rt_pro,
+        )
+        self._client.connect(params=params)
+        self._connected.wait(timeout=10.0)
+
+    def send_chunk(self, pcm_bytes: bytes):
+        if self._client and self._connected.is_set():
+            self._client.stream(pcm_bytes)
+
+    def stop(self) -> str:
+        if self._client:
+            self._client.disconnect(terminate=True)
+            self._client = None
+        result = " ".join(self._finals)
+        log.info(f"Realtime transcription complete: {len(self._finals)} utterances")
+        return result
 
 
 def process_meeting(mp3_path: str, transcript_dir: str, notes_dir: str, context=None) -> str | None:

@@ -20,8 +20,9 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from PySide6.QtCore import QObject, Signal, QTimer, Qt
 
 from recorder import Recorder, list_microphones, list_speakers
-from transcriber import process_meeting
+from transcriber import process_meeting, generate_notes, RealtimeTranscriptionSession
 from context_dialog import ask_meeting_context
+from live_transcript_window import LiveTranscriptBridge, LiveTranscriptWindow
 from logger import log
 
 # ── Paths ──────────────────────────────────────────────────────────────────
@@ -34,14 +35,18 @@ for d in (AUDIO_DIR, TRANSCRIPT_DIR, NOTES_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 # ── State ──────────────────────────────────────────────────────────────────
-recorder         = Recorder(str(AUDIO_DIR))
-_tray_icon       = None
-_bridge          = None
-_status          = "idle"   # idle | recording | processing
-_start_time      = None
-_last_mp3        = None
-_auto_transcribe = False
-_stop_tooltip    = threading.Event()
+recorder          = Recorder(str(AUDIO_DIR))
+_tray_icon        = None
+_bridge           = None
+_live_bridge      = None   # LiveTranscriptBridge (created in main())
+_live_window      = None   # LiveTranscriptWindow | None
+_status           = "idle"   # idle | recording | processing
+_start_time       = None
+_last_mp3         = None
+_auto_transcribe  = False
+_realtime_mode    = False
+_realtime_session = None   # RealtimeTranscriptionSession | None
+_stop_tooltip     = threading.Event()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -108,12 +113,18 @@ class UIBridge(QObject):
     """Receives signals from tray/worker threads and runs Qt UI on main thread."""
 
     _request_file_pick   = Signal()
-    _request_context     = Signal(str)   # mp3 path
+    _request_context     = Signal(str)        # mp3 path
+    _request_context_rt  = Signal(str, str)   # mp3 path, realtime transcript
+    _open_live_window    = Signal()
+    _close_live_window   = Signal()
 
     def __init__(self):
         super().__init__()
         self._request_file_pick.connect(self._do_file_pick)
         self._request_context.connect(self._do_show_context)
+        self._request_context_rt.connect(self._do_show_context_rt)
+        self._open_live_window.connect(self._do_open_live_window)
+        self._close_live_window.connect(self._do_close_live_window)
 
     # Called from any thread — safely
     def open_file_and_transcribe(self):
@@ -122,7 +133,29 @@ class UIBridge(QObject):
     def show_context_and_transcribe(self, mp3_path: str):
         self._request_context.emit(mp3_path)
 
+    def show_context_and_transcribe_rt(self, mp3_path: str, realtime_transcript: str):
+        self._request_context_rt.emit(mp3_path, realtime_transcript)
+
+    def open_live_window(self):
+        self._open_live_window.emit()
+
+    def close_live_window(self):
+        self._close_live_window.emit()
+
     # ── Runs on main thread ──
+
+    def _do_open_live_window(self):
+        global _live_window
+        _live_window = LiveTranscriptWindow()
+        _live_bridge._update_partial.connect(_live_window.on_partial)
+        _live_bridge._commit_final.connect(_live_window.on_final)
+        _live_bridge._close_window.connect(_live_window.close_window)
+
+    def _do_close_live_window(self):
+        global _live_window
+        if _live_window:
+            _live_window.close_window()
+            _live_window = None
 
     def _do_file_pick(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -157,6 +190,28 @@ class UIBridge(QObject):
             target=_pipeline, args=(mp3_path, context), daemon=True
         ).start()
 
+    def _do_show_context_rt(self, mp3_path: str, realtime_transcript: str):
+        global _status
+        stem    = Path(mp3_path).stem.replace("meeting_", "").replace("_", " ")
+        context = ask_meeting_context(default_title=stem)
+
+        if context is None:
+            log.info("Transcription cancelled by user.")
+            _status = "idle"
+            if _tray_icon:
+                _tray_icon.icon = make_icon("idle")
+                _tray_icon.update_menu()
+            return
+
+        _status = "processing"
+        if _tray_icon:
+            _tray_icon.icon = make_icon("processing")
+            _tray_icon.update_menu()
+
+        threading.Thread(
+            target=_pipeline_rt, args=(mp3_path, realtime_transcript, context), daemon=True
+        ).start()
+
 
 # ── Transcription pipeline (worker thread) ─────────────────────────────────
 
@@ -182,10 +237,42 @@ def _pipeline(mp3_path: str, context):
             _tray_icon.update_menu()
 
 
+def _pipeline_rt(mp3_path: str, realtime_transcript: str, context):
+    global _status
+    try:
+        stem            = Path(mp3_path).stem
+        transcript_file = str(TRANSCRIPT_DIR / f"{stem}_transcript.txt")
+        notes_file      = str(NOTES_DIR / f"{stem}_notes.md")
+
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            f.write(realtime_transcript)
+        log.info(f"Realtime transcript saved: {transcript_file}")
+
+        notes = generate_notes(realtime_transcript, context=context)
+        if context and context.title:
+            notes = f"# {context.title}\n\n{notes}"
+
+        with open(notes_file, "w", encoding="utf-8") as f:
+            f.write(notes)
+        log.info(f"Notes saved: {notes_file}")
+
+        notify("MeetRec", "✅ Notes ready!")
+        if os.path.exists(notes_file):
+            os.startfile(notes_file)
+    except Exception as e:
+        log.error(f"Realtime pipeline failed: {e}")
+        notify("MeetRec", f"❌ Processing failed: {e}")
+    finally:
+        _status = "idle"
+        if _tray_icon:
+            _tray_icon.icon = make_icon("idle")
+            _tray_icon.update_menu()
+
+
 # ── Recording actions ──────────────────────────────────────────────────────
 
 def start_recording(icon, _item):
-    global _status, _start_time
+    global _status, _start_time, _realtime_session
     if _status != "idle":
         return
     _status = "recording"
@@ -193,11 +280,23 @@ def start_recording(icon, _item):
     icon.icon = make_icon("recording")
     icon.update_menu()
     log.info("Recording started")
+
+    if _realtime_mode:
+        _realtime_session = RealtimeTranscriptionSession(
+            on_partial=_live_bridge.update_partial,
+            on_final=_live_bridge.commit_final,
+        )
+        _realtime_session.start()
+        recorder.on_audio_chunk = _realtime_session.send_chunk
+        _bridge.open_live_window()
+    else:
+        recorder.on_audio_chunk = None
+
     threading.Thread(target=recorder.start, daemon=True).start()
 
 
 def stop_recording(icon, _item):
-    global _status, _last_mp3
+    global _status, _last_mp3, _realtime_session
     if _status != "recording":
         return
     log.info("Recording stopped")
@@ -205,13 +304,25 @@ def stop_recording(icon, _item):
     icon.icon = make_icon("idle")
     mp3 = recorder.stop()
     _last_mp3 = mp3
+
+    realtime_transcript = None
+    if _realtime_session:
+        _bridge.close_live_window()
+        realtime_transcript = _realtime_session.stop()
+        _realtime_session = None
+
     icon.update_menu()
 
     if not mp3:
         notify("MeetRec", "Recording failed — no audio captured.")
         return
 
-    if _auto_transcribe:
+    if realtime_transcript is not None:
+        _status = "processing"
+        icon.icon = make_icon("processing")
+        icon.update_menu()
+        _bridge.show_context_and_transcribe_rt(mp3, realtime_transcript)
+    elif _auto_transcribe:
         _status = "processing"
         icon.icon = make_icon("processing")
         icon.update_menu()
@@ -243,6 +354,13 @@ def toggle_auto_transcribe(icon, _item):
     icon.update_menu()
 
 
+def toggle_realtime_mode(icon, _item):
+    global _realtime_mode
+    _realtime_mode = not _realtime_mode
+    log.info(f"Live transcription: {'on' if _realtime_mode else 'off'}")
+    icon.update_menu()
+
+
 # ── Device selection ───────────────────────────────────────────────────────
 
 def set_mic(name):
@@ -253,6 +371,12 @@ def set_mic(name):
     return _set
 
 
+def set_mic_default(icon, _item):
+    recorder.mic_name = None
+    log.info("Microphone set to: Windows default")
+    icon.update_menu()
+
+
 def set_speaker(name):
     def _set(icon, _item):
         recorder.speaker_name = name
@@ -261,26 +385,46 @@ def set_speaker(name):
     return _set
 
 
+def set_speaker_default(icon, _item):
+    recorder.speaker_name = None
+    log.info("Speaker/loopback set to: Windows default")
+    icon.update_menu()
+
+
 def mic_submenu():
     mics = list_microphones()
-    return pystray.Menu(*[
+    return pystray.Menu(
         item(
-            f"{'✔  ' if recorder.mic_name == m or (recorder.mic_name is None and i == 0) else '     '}{m}",
-            set_mic(m),
-        )
-        for i, m in enumerate(mics)
-    ])
+            f"{'✔  ' if recorder.mic_name is None else '     '}Windows Default",
+            set_mic_default,
+        ),
+        pystray.Menu.SEPARATOR,
+        *[
+            item(
+                f"{'✔  ' if recorder.mic_name == m else '     '}{m}",
+                set_mic(m),
+            )
+            for m in mics
+        ],
+    )
 
 
 def spk_submenu():
     spks = list_speakers()
-    return pystray.Menu(*[
+    return pystray.Menu(
         item(
-            f"{'✔  ' if recorder.speaker_name == s or (recorder.speaker_name is None and i == 0) else '     '}{s}",
-            set_speaker(s),
-        )
-        for i, s in enumerate(spks)
-    ])
+            f"{'✔  ' if recorder.speaker_name is None else '     '}Windows Default",
+            set_speaker_default,
+        ),
+        pystray.Menu.SEPARATOR,
+        *[
+            item(
+                f"{'✔  ' if recorder.speaker_name == s else '     '}{s}",
+                set_speaker(s),
+            )
+            for s in spks
+        ],
+    )
 
 
 # ── Folder helpers ─────────────────────────────────────────────────────────
@@ -315,6 +459,8 @@ def build_menu():
              enabled=lambda _: _status == "idle"),
         item(lambda _: f"🔁  Auto-transcribe  {'✔' if _auto_transcribe else ''}",
              toggle_auto_transcribe),
+        item(lambda _: f"⚡  Live transcription  {'✔' if _realtime_mode else ''}",
+             toggle_realtime_mode),
         pystray.Menu.SEPARATOR,
         item("🎙️  Microphone",  pystray.Menu(mic_submenu)),
         item("🔊  Loopback",    pystray.Menu(spk_submenu)),
@@ -331,7 +477,7 @@ def build_menu():
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    global _tray_icon, _bridge
+    global _tray_icon, _bridge, _live_bridge
 
     # Qt must own the main thread
     app = QApplication(sys.argv)
@@ -340,6 +486,7 @@ def main():
     # Force non-native dialogs to avoid COM threading conflicts with pystray
     app.setAttribute(Qt.AA_DontUseNativeDialogs, True)
 
+    _live_bridge = LiveTranscriptBridge()
     _bridge = UIBridge()
 
     log.info("MeetRec started")

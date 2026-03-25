@@ -11,6 +11,7 @@ import soundfile as sf
 import numpy as np
 import threading
 import datetime
+import queue
 import os
 
 from logger import log
@@ -58,14 +59,16 @@ def _resample(audio: np.ndarray, src: int, dst: int) -> np.ndarray:
 
 class Recorder:
     def __init__(self, output_dir: str):
-        self.output_dir   = output_dir
-        self.mic_name     = None   # None = use default
-        self.speaker_name = None   # None = use default
-        self._stop_event  = threading.Event()
+        self.output_dir    = output_dir
+        self.mic_name      = None   # None = use default
+        self.speaker_name  = None   # None = use default
+        self.on_audio_chunk = None  # Callable[[bytes], None] for real-time streaming
+        self._stop_event   = threading.Event()
         self._mic_chunks: list = []
         self._sys_chunks: list = []
-        self._mic_rate    = OUTPUT_RATE
-        self._sys_rate    = 48000
+        self._mic_rate     = OUTPUT_RATE
+        self._sys_rate     = 48000
+        self._mix_thread   = None
 
     def start(self):
         """Begin recording. Blocks until stop() is called."""
@@ -87,12 +90,19 @@ class Recorder:
         self._sys_rate = get_sys_samplerate(loopback)
         log.info(f"Recording started | mic={mic.name} @ {self._mic_rate}Hz | loopback={loopback.name} @ {self._sys_rate}Hz")
 
+        streaming = self.on_audio_chunk is not None
+        mic_q = queue.Queue() if streaming else None
+        sys_q = queue.Queue() if streaming else None
+
         def record_mic():
             try:
                 with mic.recorder(samplerate=self._mic_rate, channels=1) as rec:
                     while not self._stop_event.is_set():
                         data = rec.record(numframes=int(self._mic_rate * CHUNK_DURATION))
                         self._mic_chunks.append(data)
+                        if streaming:
+                            mono = data[:, 0] if data.ndim > 1 else data
+                            mic_q.put(_resample(mono, self._mic_rate, OUTPUT_RATE))
             except Exception as e:
                 log.error(f"Mic recording error: {e}")
 
@@ -102,15 +112,47 @@ class Recorder:
                     while not self._stop_event.is_set():
                         data = rec.record(numframes=int(self._sys_rate * CHUNK_DURATION))
                         self._sys_chunks.append(data)
+                        if streaming:
+                            mono = data.mean(axis=1) if data.ndim > 1 else data
+                            sys_q.put(_resample(mono, self._sys_rate, OUTPUT_RATE))
             except Exception as e:
                 log.error(f"System audio recording error: {e}")
+
+        def mix_and_stream():
+            while not self._stop_event.is_set() or not mic_q.empty():
+                try:
+                    mic_c = mic_q.get(timeout=0.6)
+                except queue.Empty:
+                    continue
+                try:
+                    sys_c = sys_q.get(timeout=0.1)
+                except queue.Empty:
+                    sys_c = np.zeros_like(mic_c)
+                min_len = min(len(mic_c), len(sys_c))
+                mixed = (mic_c[:min_len] * 1.3) + (sys_c[:min_len] * 0.8)
+                peak = np.max(np.abs(mixed))
+                if peak > 0:
+                    mixed = mixed / peak * 0.95
+                try:
+                    self.on_audio_chunk((mixed * 32767).astype(np.int16).tobytes())
+                except Exception as e:
+                    log.error(f"Chunk callback error: {e}")
 
         mic_t = threading.Thread(target=record_mic, daemon=True)
         sys_t = threading.Thread(target=record_sys,  daemon=True)
         mic_t.start()
         sys_t.start()
+
+        if streaming:
+            self._mix_thread = threading.Thread(target=mix_and_stream, daemon=True)
+            self._mix_thread.start()
+
         mic_t.join()
         sys_t.join()
+
+        if self._mix_thread:
+            self._mix_thread.join(timeout=3.0)
+            self._mix_thread = None
 
     def stop(self) -> str | None:
         """Stop recording, mix and save MP3. Returns path or None."""
