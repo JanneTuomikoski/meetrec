@@ -4,13 +4,13 @@ context_dialog.py – PySide6 meeting context dialog for MeetRec.
 
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QComboBox,
     QPushButton, QFrame, QSizePolicy
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QColor, QPalette
 
 LANGUAGES = [
     ("Auto-detect",  ""),
@@ -20,6 +20,15 @@ LANGUAGES = [
     ("German",       "de"),
     ("French",       "fr"),
     ("Spanish",      "es"),
+]
+
+MEETING_TYPES = [
+    ("General",       "general"),
+    ("Standup",       "standup"),
+    ("1:1",           "one_on_one"),
+    ("Brainstorming", "brainstorm"),
+    ("Interview",     "interview"),
+    ("Client Call",   "client"),
 ]
 
 STYLE = """
@@ -116,15 +125,16 @@ QFrame#divider {
 
 @dataclass
 class MeetingContext:
-    title:        str = ""
-    participants: str = ""
-    agenda:       str = ""
-    language:     str = ""
-    notes_language: str = "en" 
+    title:          str = ""
+    participants:   str = ""
+    agenda:         str = ""
+    language:       str = ""
+    notes_language: str = "en"
+    meeting_type:   str = "general"
+
 
 class ContextDialog(QDialog):
     def __init__(self, default_title: str = ""):
-        # Ensure a QApplication exists
         self._app = QApplication.instance() or QApplication(sys.argv)
 
         super().__init__()
@@ -194,6 +204,15 @@ class ContextDialog(QDialog):
         root.addWidget(self.agenda_input)
         root.addSpacing(12)
 
+        # ── Meeting type ──
+        root.addWidget(self._field_label("MEETING TYPE"))
+        self.meeting_type_combo = QComboBox()
+        for label, code in MEETING_TYPES:
+            self.meeting_type_combo.addItem(label, code)
+        self.meeting_type_combo.setFixedHeight(38)
+        root.addWidget(self.meeting_type_combo)
+        root.addSpacing(12)
+
         # ── Language ──
         root.addWidget(self._field_label("LANGUAGE"))
         self.lang_combo = QComboBox()
@@ -201,10 +220,9 @@ class ContextDialog(QDialog):
             self.lang_combo.addItem(label, code)
         self.lang_combo.setFixedHeight(38)
         root.addWidget(self.lang_combo)
-        root.addSpacing(20)
+        root.addSpacing(12)
 
         # ── Notes language ──
-        root.addSpacing(12)
         root.addWidget(self._field_label("NOTES LANGUAGE"))
         self.notes_lang_combo = QComboBox()
         self.notes_lang_combo.addItem("English", "en")
@@ -213,7 +231,7 @@ class ContextDialog(QDialog):
         root.addWidget(self.notes_lang_combo)
 
         # ── Buttons ──
-        root.addSpacing(12)
+        root.addSpacing(16)
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
 
@@ -241,11 +259,12 @@ class ContextDialog(QDialog):
 
     def _on_ok(self):
         self.result_context = MeetingContext(
-            title        = self.title_input.text().strip(),
-            participants = self.participants_input.text().strip(),
-            agenda       = self.agenda_input.toPlainText().strip(),
-            language     = self.lang_combo.currentData(),
+            title          = self.title_input.text().strip(),
+            participants   = self.participants_input.text().strip(),
+            agenda         = self.agenda_input.toPlainText().strip(),
+            language       = self.lang_combo.currentData(),
             notes_language = self.notes_lang_combo.currentData(),
+            meeting_type   = self.meeting_type_combo.currentData(),
         )
         self.accept()
 
@@ -259,7 +278,69 @@ class ContextDialog(QDialog):
 
 
 def ask_meeting_context(default_title: str = "") -> MeetingContext | None:
-    """Show the dialog and return MeetingContext, or None if cancelled."""
+    """Show the context dialog and return MeetingContext, or None if cancelled."""
     dlg = ContextDialog(default_title=default_title)
     dlg.exec()
     return dlg.result_context
+
+
+def ask_notes_conflict(notes_path: str) -> str | None:
+    """Ask what to do when notes already exist for a recording.
+    Returns 'overwrite', 'append', 'improve', or None (cancel)."""
+    dlg = QDialog()
+    dlg.setWindowTitle("MeetRec — Notes Already Exist")
+    dlg.setWindowFlags(dlg.windowFlags() | Qt.WindowStaysOnTopHint)
+    dlg.setFixedWidth(420)
+    dlg.setStyleSheet(STYLE)
+
+    result = [None]
+
+    layout = QVBoxLayout(dlg)
+    layout.setContentsMargins(24, 22, 24, 20)
+    layout.setSpacing(0)
+
+    title_lbl = QLabel("Notes already exist")
+    title_lbl.setStyleSheet("color:#cdd6f4; font-size:15px; font-weight:700;")
+    layout.addWidget(title_lbl)
+
+    filename = Path(notes_path).name
+    sub_lbl = QLabel(
+        f"<span style='color:#6c7086;font-size:11px;font-weight:400'>{filename}</span>"
+    )
+    sub_lbl.setTextFormat(Qt.RichText)
+    sub_lbl.setStyleSheet("margin-top:4px; margin-bottom:6px;")
+    layout.addWidget(sub_lbl)
+
+    desc_lbl = QLabel("What would you like to do with the existing notes?")
+    desc_lbl.setStyleSheet("color:#a6adc8; font-size:12px; font-weight:400; margin-bottom:16px;")
+    desc_lbl.setWordWrap(True)
+    layout.addWidget(desc_lbl)
+
+    div = QFrame()
+    div.setFrameShape(QFrame.HLine)
+    div.setStyleSheet("background:#313244; margin-bottom:16px;")
+    div.setFixedHeight(1)
+    layout.addWidget(div)
+
+    btn_row = QHBoxLayout()
+    btn_row.setSpacing(8)
+
+    def make_btn(label, obj_name, action):
+        b = QPushButton(label)
+        b.setObjectName(obj_name)
+        b.setCursor(Qt.PointingHandCursor)
+        def _click():
+            result[0] = action
+            dlg.accept()
+        b.clicked.connect(_click)
+        return b
+
+    btn_row.addWidget(make_btn("Cancel",      "btn_cancel",    None))
+    btn_row.addStretch()
+    btn_row.addWidget(make_btn("Overwrite",   "btn_secondary", "overwrite"))
+    btn_row.addWidget(make_btn("Append",      "btn_secondary", "append"))
+    btn_row.addWidget(make_btn("Improve ✨",  "btn_primary",   "improve"))
+    layout.addLayout(btn_row)
+
+    dlg.exec()
+    return result[0]

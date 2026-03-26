@@ -5,6 +5,7 @@ API keys loaded from .env. Accepts optional MeetingContext for richer notes.
 """
 
 import os
+import time
 import threading
 from pathlib import Path
 from dotenv import load_dotenv
@@ -25,6 +26,56 @@ load_dotenv(Path(__file__).parent / ".env")
 
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY",  "")
+
+MEETING_PROMPTS = {
+    "general": """Analyze this meeting transcript and produce:
+
+1. **Meeting Summary** – 3-5 sentence overview
+2. **Key Discussion Points** – bullet list of main topics
+3. **Decisions Made** – what was agreed upon
+4. **Action Items / To-Do List** – who does what by when (if mentioned)
+5. **Follow-up Questions** – anything left unresolved""",
+
+    "standup": """Analyze this standup transcript and produce a concise summary:
+
+1. **Updates per person** – what each person accomplished since last standup
+2. **Plans** – what each person will work on next
+3. **Blockers** – anything blocking progress or needing team attention""",
+
+    "one_on_one": """Analyze this 1:1 meeting transcript and produce:
+
+1. **Summary** – 2-3 sentence overview of the conversation
+2. **Topics Discussed** – main subjects covered
+3. **Feedback Given / Received** – any feedback exchanged
+4. **Goals & Development** – career or project goals mentioned
+5. **Action Items** – concrete next steps for each person""",
+
+    "brainstorm": """Analyze this brainstorming session transcript and produce:
+
+1. **Summary** – what problem or topic was being explored
+2. **Ideas Generated** – all ideas mentioned, grouped by theme if possible
+3. **Top Candidates** – ideas that received the most enthusiasm or discussion
+4. **Rejected / Parked Ideas** – ideas set aside and why (if mentioned)
+5. **Next Steps** – any decisions to pursue specific ideas""",
+
+    "interview": """Analyze this interview transcript and produce:
+
+1. **Candidate / Role** – who was interviewed and for what position (if mentioned)
+2. **Key Strengths** – positive signals from the interview
+3. **Concerns / Gaps** – areas of uncertainty or weakness noted
+4. **Notable Responses** – standout answers (good or bad)
+5. **Recommendation** – hire / no hire / follow-up (if discussed)
+6. **Next Steps** – what happens next in the process""",
+
+    "client": """Analyze this client call transcript and produce:
+
+1. **Summary** – 2-3 sentence overview
+2. **Client Needs & Requests** – what the client asked for or raised
+3. **Commitments Made** – what was promised to the client
+4. **Issues / Concerns Raised** – problems or risks mentioned
+5. **Action Items** – follow-up tasks with owners (if mentioned)
+6. **Next Steps** – agreed timeline or next meeting""",
+}
 
 
 def transcribe_with_speakers(mp3_path: str, language: str = "") -> str:
@@ -61,7 +112,7 @@ def transcribe_with_speakers(mp3_path: str, language: str = "") -> str:
     return "\n".join(lines)
 
 
-def generate_notes(raw_text: str, context=None) -> str:
+def generate_notes(raw_text: str, context=None, existing_notes: str = "") -> str:
     log.info("Generating notes with Claude")
 
     notes_lang = "Finnish" if (context and context.notes_language == "fi") else "English"
@@ -79,24 +130,34 @@ def generate_notes(raw_text: str, context=None) -> str:
             context_block = "Context provided:\n" + "\n".join(parts) + "\n\n"
 
     claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = claude.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=2000,
-        messages=[{
-            "role": "user",
-            "content": f"""You are an expert meeting note-taker. Write all notes in {notes_lang}. Analyze this meeting transcript and produce:
 
-1. **Meeting Summary** – 3-5 sentence overview
-2. **Key Discussion Points** – bullet list of main topics
-3. **Decisions Made** – what was agreed upon
-4. **Action Items / To-Do List** – who does what by when (if mentioned)
-5. **Follow-up Questions** – anything left unresolved
+    if existing_notes:
+        prompt = f"""You are an expert meeting note-taker. Write all notes in {notes_lang}.
+
+Here are the existing notes previously generated for this recording:
+
+{existing_notes}
+
+Here is the complete meeting transcript:
+
+{context_block}Transcript:
+{raw_text}
+
+Please improve and refine the existing notes based on the full transcript. Fix any inaccuracies, fill in missing information, clarify unclear points, and ensure all action items and decisions are captured. Maintain the same structure and format."""
+    else:
+        meeting_type = (context.meeting_type if context and hasattr(context, "meeting_type") else None) or "general"
+        structure = MEETING_PROMPTS.get(meeting_type, MEETING_PROMPTS["general"])
+        prompt = f"""You are an expert meeting note-taker. Write all notes in {notes_lang}. {structure}
 
 {context_block}Speakers are labeled A, B, C etc. Use participant names from the context above wherever possible instead of Speaker A/B/C.
 
 Transcript:
 {raw_text}"""
-        }]
+
+    response = claude.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}]
     )
 
     notes = response.content[0].text
@@ -113,47 +174,66 @@ class RealtimeTranscriptionSession:
         self._finals: list[str] = []
         self._client  = None
         self._connected = threading.Event()
+        self._sample_rate = 16000
+        self._stop_requested = False
 
-    def start(self, sample_rate: int = 16000):
+    def _on_begin(self, _client, event):
+        self._connected.set()
+        log.info(f"Streaming session started: {event.id}")
+
+    def _on_turn(self, _client, event):
+        if not event.transcript:
+            return
+        if event.end_of_turn:
+            if not self._finals or self._finals[-1] != event.transcript:
+                self._finals.append(event.transcript)
+                if self.on_final:
+                    self.on_final(event.transcript)
+        else:
+            if self.on_partial:
+                self.on_partial(event.transcript)
+
+    def _on_error(self, _client, error):
+        log.error(f"RealtimeTranscriber error: {error}")
+        if not self._stop_requested:
+            threading.Thread(target=self._reconnect, daemon=True).start()
+
+    def _reconnect(self):
+        log.info("Streaming error — attempting reconnect in 2s...")
+        time.sleep(2)
+        if self._stop_requested:
+            return
+        try:
+            self._connected.clear()
+            self._do_connect()
+            log.info("Reconnected to streaming API")
+        except Exception as e:
+            log.error(f"Reconnect failed: {e}")
+
+    def _do_connect(self):
         options = StreamingClientOptions(api_key=ASSEMBLYAI_API_KEY)
         self._client = StreamingClient(options=options)
-
-        def _on_begin(_client, event):
-            self._connected.set()
-            log.info(f"Streaming session started: {event.id}")
-
-        def _on_turn(_client, event):
-            if not event.transcript:
-                return
-            if event.end_of_turn:
-                # Skip if identical to the previous final (API occasionally re-emits)
-                if not self._finals or self._finals[-1] != event.transcript:
-                    self._finals.append(event.transcript)
-                    if self.on_final:
-                        self.on_final(event.transcript)
-            else:
-                if self.on_partial:
-                    self.on_partial(event.transcript)
-
-        def _on_error(_client, error):
-            log.error(f"RealtimeTranscriber error: {error}")
-
-        self._client.on(StreamingEvents.Begin, _on_begin)
-        self._client.on(StreamingEvents.Turn,  _on_turn)
-        self._client.on(StreamingEvents.Error, _on_error)
-
+        self._client.on(StreamingEvents.Begin, self._on_begin)
+        self._client.on(StreamingEvents.Turn,  self._on_turn)
+        self._client.on(StreamingEvents.Error, self._on_error)
         params = StreamingParameters(
-            sample_rate=sample_rate,
+            sample_rate=self._sample_rate,
             speech_model=SpeechModel.u3_rt_pro,
         )
         self._client.connect(params=params)
         self._connected.wait(timeout=10.0)
+
+    def start(self, sample_rate: int = 16000):
+        self._sample_rate = sample_rate
+        self._stop_requested = False
+        self._do_connect()
 
     def send_chunk(self, pcm_bytes: bytes):
         if self._client and self._connected.is_set():
             self._client.stream(pcm_bytes)
 
     def stop(self) -> str:
+        self._stop_requested = True
         if self._client:
             self._client.disconnect(terminate=True)
             self._client = None
@@ -162,8 +242,10 @@ class RealtimeTranscriptionSession:
         return result
 
 
-def process_meeting(mp3_path: str, transcript_dir: str, notes_dir: str, context=None) -> str | None:
-    """Full pipeline: transcribe → save transcript → generate notes → save notes.
+def process_meeting(mp3_path: str, transcript_dir: str, notes_dir: str, context=None,
+                    notes_mode: str = "overwrite", existing_notes: str = "") -> str | None:
+    """Full pipeline: transcribe → save transcript → generate/update notes → save notes.
+    notes_mode: 'overwrite' (default), 'append', or 'improve'.
     Returns path to the notes .md file."""
 
     if not os.path.exists(mp3_path):
@@ -182,11 +264,20 @@ def process_meeting(mp3_path: str, transcript_dir: str, notes_dir: str, context=
         f.write(raw_text)
     log.info(f"Transcript saved: {transcript_file}")
 
-    notes = generate_notes(raw_text, context=context)
-
-    # Prepend title if provided
-    if context and context.title:
-        notes = f"# {context.title}\n\n{notes}"
+    if notes_mode == "append":
+        notes = generate_notes(raw_text, context=context)
+        if context and context.title:
+            notes = f"# {context.title}\n\n{notes}"
+        if existing_notes:
+            notes = existing_notes + "\n\n---\n\n" + notes
+    elif notes_mode == "improve":
+        notes = generate_notes(raw_text, context=context, existing_notes=existing_notes)
+        if context and context.title and not notes.startswith("#"):
+            notes = f"# {context.title}\n\n{notes}"
+    else:  # overwrite
+        notes = generate_notes(raw_text, context=context)
+        if context and context.title:
+            notes = f"# {context.title}\n\n{notes}"
 
     with open(notes_file, "w", encoding="utf-8") as f:
         f.write(notes)
