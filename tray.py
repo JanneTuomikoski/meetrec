@@ -10,8 +10,11 @@ import json
 import threading
 import time
 import os
+import re
+import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 import pystray
 from pystray import MenuItem as item
@@ -47,6 +50,7 @@ _start_time            = None
 _last_mp3              = None
 _auto_transcribe       = False
 _realtime_mode         = False
+_obsidian_vault: str | None = None
 _realtime_session      = None   # RealtimeTranscriptionSession | None
 _partial_transcript_path: str | None = None
 _stop_tooltip          = threading.Event()
@@ -55,7 +59,7 @@ _stop_tooltip          = threading.Event()
 # ── Settings persistence ───────────────────────────────────────────────────
 
 def _load_settings():
-    global _auto_transcribe, _realtime_mode
+    global _auto_transcribe, _realtime_mode, _obsidian_vault
     try:
         if SETTINGS_FILE.exists():
             s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -63,6 +67,7 @@ def _load_settings():
             _realtime_mode        = s.get("realtime_mode", False)
             recorder.mic_name     = s.get("mic_name")
             recorder.speaker_name = s.get("speaker_name")
+            _obsidian_vault       = s.get("obsidian_vault")
             log.info("Settings loaded")
     except Exception as e:
         log.error(f"Failed to load settings: {e}")
@@ -75,9 +80,63 @@ def _save_settings():
             "realtime_mode":    _realtime_mode,
             "mic_name":         recorder.mic_name,
             "speaker_name":     recorder.speaker_name,
+            "obsidian_vault":   _obsidian_vault,
         }, indent=2), encoding="utf-8")
     except Exception as e:
         log.error(f"Failed to save settings: {e}")
+
+
+# ── Obsidian export ────────────────────────────────────────────────────────
+
+def _obsidian_filename(mp3_stem: str, context) -> str:
+    """Build a smart Obsidian filename from the recording stem and meeting context."""
+    # Extract date/time from stem: meeting_YYYY-MM-DD_HH-MM-SS
+    bare = mp3_stem.replace("meeting_", "")
+    parts = bare.split("_")
+    date_str = parts[0] if parts else time.strftime("%Y-%m-%d")
+    time_str = parts[1].replace("-", ":") if len(parts) > 1 else ""
+
+    if context and getattr(context, "title", None):
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", context.title).strip()
+        return f"{date_str} {safe_title}.md"
+    elif context and getattr(context, "meeting_type", None):
+        mtype = context.meeting_type.capitalize()
+        suffix = f" {time_str[:5]}" if time_str else ""
+        return f"{date_str} {mtype}{suffix}.md"
+    else:
+        suffix = f" {time_str[:5]}" if time_str else ""
+        return f"{date_str} Meeting{suffix}.md"
+
+
+def _copy_to_obsidian(notes_file: str, mp3_stem: str, context) -> "Path | None":
+    global _obsidian_vault
+    if not _obsidian_vault or not os.path.isdir(_obsidian_vault):
+        return None
+    try:
+        filename = _obsidian_filename(mp3_stem, context)
+        dest = Path(_obsidian_vault) / filename
+        # Avoid silently overwriting: append counter if needed
+        if dest.exists():
+            base, n = dest.stem, 2
+            while dest.exists():
+                dest = Path(_obsidian_vault) / f"{base} ({n}).md"
+                n += 1
+        shutil.copy2(notes_file, dest)
+        log.info(f"Notes copied to Obsidian: {dest}")
+        return dest
+    except Exception as e:
+        log.error(f"Failed to copy to Obsidian: {e}")
+        return None
+
+
+def _open_in_obsidian(dest: "Path"):
+    """Open a file inside the Obsidian vault using the obsidian:// URI scheme."""
+    vault_name = Path(_obsidian_vault).name
+    # Relative path inside the vault, without .md extension
+    rel = dest.relative_to(_obsidian_vault).with_suffix("")
+    uri = f"obsidian://open?vault={quote(vault_name)}&file={quote(str(rel).replace(os.sep, '/'))}"
+    log.info(f"Opening Obsidian URI: {uri}")
+    os.startfile(uri)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -149,6 +208,7 @@ class UIBridge(QObject):
     """Receives signals from tray/worker threads and runs Qt UI on main thread."""
 
     _request_file_pick   = Signal()
+    _request_vault_pick  = Signal()
     _request_context     = Signal(str)        # mp3 path
     _request_context_rt  = Signal(str, str)   # mp3 path, realtime transcript
     _open_live_window    = Signal()
@@ -157,6 +217,7 @@ class UIBridge(QObject):
     def __init__(self):
         super().__init__()
         self._request_file_pick.connect(self._do_file_pick)
+        self._request_vault_pick.connect(self._do_vault_pick)
         self._request_context.connect(self._do_show_context)
         self._request_context_rt.connect(self._do_show_context_rt)
         self._open_live_window.connect(self._do_open_live_window)
@@ -165,6 +226,9 @@ class UIBridge(QObject):
     # Called from any thread — safely
     def open_file_and_transcribe(self):
         self._request_file_pick.emit()
+
+    def pick_obsidian_vault(self):
+        self._request_vault_pick.emit()
 
     def show_context_and_transcribe(self, mp3_path: str):
         self._request_context.emit(mp3_path)
@@ -202,6 +266,17 @@ class UIBridge(QObject):
         )
         if path:
             self._do_show_context(path)
+
+    def _do_vault_pick(self):
+        global _obsidian_vault
+        start = _obsidian_vault or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(None, "Select Obsidian vault folder", start)
+        if folder:
+            _obsidian_vault = folder
+            _save_settings()
+            log.info(f"Obsidian vault set to: {folder}")
+            if _tray_icon:
+                _tray_icon.update_menu()
 
     def _do_show_context(self, mp3_path: str):
         global _status
@@ -295,8 +370,13 @@ def _pipeline(mp3_path: str, context, notes_mode: str = "overwrite", existing_no
             notes_mode=notes_mode,
             existing_notes=existing_notes,
         )
-        notify("MeetRec", "✅ Notes ready!")
+        obsidian_dest = None
         if notes_file and os.path.exists(notes_file):
+            obsidian_dest = _copy_to_obsidian(notes_file, Path(mp3_path).stem, context)
+        notify("MeetRec", "✅ Notes ready!")
+        if obsidian_dest:
+            _open_in_obsidian(obsidian_dest)
+        elif notes_file and os.path.exists(notes_file):
             os.startfile(notes_file)
     except Exception as e:
         log.error(f"Transcription pipeline failed: {e}")
@@ -339,6 +419,8 @@ def _pipeline_rt(mp3_path: str, realtime_transcript: str, context,
             f.write(notes)
         log.info(f"Notes saved: {notes_file}")
 
+        obsidian_dest = _copy_to_obsidian(notes_file, stem, context)
+
         # Clean up partial transcript backup now that notes are saved
         if _partial_transcript_path and os.path.exists(_partial_transcript_path):
             try:
@@ -349,7 +431,9 @@ def _pipeline_rt(mp3_path: str, realtime_transcript: str, context,
         _partial_transcript_path = None
 
         notify("MeetRec", "✅ Notes ready!")
-        if os.path.exists(notes_file):
+        if obsidian_dest:
+            _open_in_obsidian(obsidian_dest)
+        elif os.path.exists(notes_file):
             os.startfile(notes_file)
     except Exception as e:
         log.error(f"Realtime pipeline failed: {e}")
@@ -460,6 +544,15 @@ def transcribe_specific(mp3_path: str):
         icon.update_menu()
         _bridge.show_context_and_transcribe(mp3_path)
     return _do
+
+
+def set_obsidian_vault(icon, _item):
+    _bridge.pick_obsidian_vault()
+
+
+def open_obsidian_vault(icon, _item):
+    if _obsidian_vault and os.path.isdir(_obsidian_vault):
+        os.startfile(_obsidian_vault)
 
 
 def toggle_auto_transcribe(icon, _item):
@@ -612,6 +705,13 @@ def build_menu():
         item("📁  Audio folder",        open_folder(AUDIO_DIR)),
         item("📄  Transcripts folder",  open_folder(TRANSCRIPT_DIR)),
         item("🗒️  Notes folder",        open_folder(NOTES_DIR)),
+        pystray.Menu.SEPARATOR,
+        item(
+            lambda _: f"📗  Obsidian vault  {'✔' if _obsidian_vault and os.path.isdir(_obsidian_vault) else ''}",
+            open_obsidian_vault,
+            enabled=lambda _: bool(_obsidian_vault and os.path.isdir(_obsidian_vault)),
+        ),
+        item("    Set Obsidian vault…",  set_obsidian_vault),
         item("📋  Open log",            lambda i, _: os.startfile(str(BASE_DIR / "records" / "meetrec.log"))),
         pystray.Menu.SEPARATOR,
         item("Quit", on_quit),
