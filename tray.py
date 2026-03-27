@@ -683,36 +683,53 @@ def on_quit(icon, _item):
 
 # ── Menu ───────────────────────────────────────────────────────────────────
 
-def build_menu():
+def folders_submenu():
     return pystray.Menu(
-        item("▶  Start Recording",      start_recording, enabled=lambda _: _status == "idle"),
-        item("⏹  Stop Recording",       stop_recording,  enabled=lambda _: _status == "recording"),
-        pystray.Menu.SEPARATOR,
-        item("📝  Transcribe & Notes",   transcribe_last,
-             enabled=lambda _: _status == "idle" and bool(_last_mp3)),
-        item("📂  Transcribe a file…",   transcribe_file,
-             enabled=lambda _: _status == "idle"),
-        item("📼  Recent recordings",    pystray.Menu(recordings_submenu),
-             enabled=lambda _: _status == "idle"),
+        item("📁  Audio folder",       open_folder(AUDIO_DIR)),
+        item("📄  Transcripts folder", open_folder(TRANSCRIPT_DIR)),
+        item("🗒️  Notes folder",       open_folder(NOTES_DIR)),
+    )
+
+
+def obsidian_submenu():
+    return pystray.Menu(
+        item("Open vault", open_obsidian_vault,
+             enabled=lambda _: bool(_obsidian_vault and os.path.isdir(_obsidian_vault))),
+        item("Set vault…", set_obsidian_vault),
+    )
+
+
+def settings_submenu():
+    return pystray.Menu(
         item(lambda _: f"🔁  Auto-transcribe  {'✔' if _auto_transcribe else ''}",
              toggle_auto_transcribe),
         item(lambda _: f"⚡  Live transcription  {'✔' if _realtime_mode else ''}",
              toggle_realtime_mode),
         pystray.Menu.SEPARATOR,
-        item("🎙️  Microphone",  pystray.Menu(mic_submenu)),
-        item("🔊  Loopback",    pystray.Menu(spk_submenu)),
+        item("🎙️  Microphone", pystray.Menu(mic_submenu)),
+        item("🔊  Loopback",   pystray.Menu(spk_submenu)),
         pystray.Menu.SEPARATOR,
-        item("📁  Audio folder",        open_folder(AUDIO_DIR)),
-        item("📄  Transcripts folder",  open_folder(TRANSCRIPT_DIR)),
-        item("🗒️  Notes folder",        open_folder(NOTES_DIR)),
+        item(lambda _: f"📗  Obsidian vault  {'✔' if _obsidian_vault and os.path.isdir(_obsidian_vault) else ''}",
+             pystray.Menu(obsidian_submenu)),
         pystray.Menu.SEPARATOR,
-        item(
-            lambda _: f"📗  Obsidian vault  {'✔' if _obsidian_vault and os.path.isdir(_obsidian_vault) else ''}",
-            open_obsidian_vault,
-            enabled=lambda _: bool(_obsidian_vault and os.path.isdir(_obsidian_vault)),
-        ),
-        item("    Set Obsidian vault…",  set_obsidian_vault),
-        item("📋  Open log",            lambda i, _: os.startfile(str(BASE_DIR / "records" / "meetrec.log"))),
+        item("📁  Folders",  pystray.Menu(folders_submenu)),
+        item("📋  Open log", lambda _i, _: os.startfile(str(BASE_DIR / "records" / "meetrec.log"))),
+    )
+
+
+def build_menu():
+    return pystray.Menu(
+        item("▶  Start Recording", start_recording, enabled=lambda _: _status == "idle"),
+        item("⏹  Stop Recording",  stop_recording,  enabled=lambda _: _status == "recording"),
+        pystray.Menu.SEPARATOR,
+        item("📝  Transcribe & Notes", transcribe_last,
+             enabled=lambda _: _status == "idle" and bool(_last_mp3)),
+        item("📂  Transcribe a file…", transcribe_file,
+             enabled=lambda _: _status == "idle"),
+        item("📼  Recent recordings",  pystray.Menu(recordings_submenu),
+             enabled=lambda _: _status == "idle"),
+        pystray.Menu.SEPARATOR,
+        item("⚙️  Settings", pystray.Menu(settings_submenu)),
         pystray.Menu.SEPARATOR,
         item("Quit", on_quit),
     )
