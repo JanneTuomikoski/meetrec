@@ -65,6 +65,8 @@ class Recorder:
         self.mic_boost     = 1.3
         self.sys_boost     = 0.8
         self.on_audio_chunk = None  # Callable[[bytes], None] for real-time streaming
+        self.on_mic_level  = None   # Callable[[float], None] RMS level 0–1
+        self.on_sys_level  = None   # Callable[[float], None] RMS level 0–1
         self._stop_event   = threading.Event()
         self._mic_chunks: list = []
         self._sys_chunks: list = []
@@ -104,8 +106,10 @@ class Recorder:
                     while not self._stop_event.is_set():
                         data = rec.record(numframes=int(self._mic_rate * CHUNK_DURATION))
                         self._mic_chunks.append(data)
+                        mono = data[:, 0] if data.ndim > 1 else data
+                        if self.on_mic_level:
+                            self.on_mic_level(float(np.sqrt(np.mean(mono ** 2))))
                         if streaming:
-                            mono = data[:, 0] if data.ndim > 1 else data
                             mic_q.put(_resample(mono, self._mic_rate, OUTPUT_RATE))
             except Exception as e:
                 log.error(f"Mic recording error: {e}")
@@ -116,8 +120,10 @@ class Recorder:
                     while not self._stop_event.is_set():
                         data = rec.record(numframes=int(self._sys_rate * CHUNK_DURATION))
                         self._sys_chunks.append(data)
+                        mono = data.mean(axis=1) if data.ndim > 1 else data
+                        if self.on_sys_level:
+                            self.on_sys_level(float(np.sqrt(np.mean(mono ** 2))))
                         if streaming:
-                            mono = data.mean(axis=1) if data.ndim > 1 else data
                             sys_q.put(_resample(mono, self._sys_rate, OUTPUT_RATE))
             except Exception as e:
                 log.error(f"System audio recording error: {e}")

@@ -27,6 +27,7 @@ from recorder import Recorder, list_microphones, list_speakers
 from transcriber import process_meeting, generate_notes, RealtimeTranscriptionSession
 from context_dialog import ask_meeting_context, ask_notes_conflict
 from live_transcript_window import LiveTranscriptBridge, LiveTranscriptWindow
+from level_meter_window import LevelBridge, LevelMeterWindow
 from logger import log
 
 # ── Paths ──────────────────────────────────────────────────────────────────
@@ -45,6 +46,8 @@ _tray_icon             = None
 _bridge                = None
 _live_bridge           = None   # LiveTranscriptBridge (created in main())
 _live_window           = None   # LiveTranscriptWindow | None
+_level_bridge          = None   # LevelBridge (created in main())
+_level_window          = None   # LevelMeterWindow | None
 _status                = "idle"   # idle | recording | processing
 _start_time            = None
 _last_mp3              = None
@@ -219,6 +222,8 @@ class UIBridge(QObject):
     _request_context_rt  = Signal(str, str)   # mp3 path, realtime transcript
     _open_live_window    = Signal()
     _close_live_window   = Signal()
+    _open_level_window   = Signal()
+    _close_level_window  = Signal()
     _do_quit             = Signal()
 
     def __init__(self):
@@ -229,6 +234,8 @@ class UIBridge(QObject):
         self._request_context_rt.connect(self._do_show_context_rt)
         self._open_live_window.connect(self._do_open_live_window)
         self._close_live_window.connect(self._do_close_live_window)
+        self._open_level_window.connect(self._do_open_level_window)
+        self._close_level_window.connect(self._do_close_level_window)
         self._do_quit.connect(QApplication.instance().quit)
 
     def request_quit(self):
@@ -253,6 +260,12 @@ class UIBridge(QObject):
     def close_live_window(self):
         self._close_live_window.emit()
 
+    def open_level_window(self):
+        self._open_level_window.emit()
+
+    def close_level_window(self):
+        self._close_level_window.emit()
+
     # ── Runs on main thread ──
 
     def _do_open_live_window(self):
@@ -267,6 +280,19 @@ class UIBridge(QObject):
         if _live_window:
             _live_window.close_window()
             _live_window = None
+
+    def _do_open_level_window(self):
+        global _level_window
+        _level_window = LevelMeterWindow()
+        _level_bridge._mic_level.connect(_level_window.set_mic)
+        _level_bridge._sys_level.connect(_level_window.set_sys)
+        _level_bridge._close_window.connect(_level_window.close_window)
+
+    def _do_close_level_window(self):
+        global _level_window
+        if _level_window:
+            _level_window.close_window()
+            _level_window = None
 
     def _do_file_pick(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -462,6 +488,10 @@ def start_recording(icon, _item):
     else:
         recorder.on_audio_chunk = None
 
+    recorder.on_mic_level = _level_bridge.update_mic
+    recorder.on_sys_level = _level_bridge.update_sys
+    _bridge.open_level_window()
+
     threading.Thread(target=recorder.start, daemon=True).start()
 
 
@@ -474,6 +504,10 @@ def stop_recording(icon, _item):
     icon.icon = make_icon("idle")
     mp3 = recorder.stop()
     _last_mp3 = mp3
+
+    recorder.on_mic_level = None
+    recorder.on_sys_level = None
+    _bridge.close_level_window()
 
     realtime_transcript = None
     if _realtime_session:
@@ -770,7 +804,7 @@ def build_menu():
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    global _tray_icon, _bridge, _live_bridge
+    global _tray_icon, _bridge, _live_bridge, _level_bridge
 
     # Qt must own the main thread
     app = QApplication(sys.argv)
@@ -780,6 +814,7 @@ def main():
     app.setAttribute(Qt.AA_DontUseNativeDialogs, True)
 
     _live_bridge = LiveTranscriptBridge()
+    _level_bridge = LevelBridge()
     _bridge = UIBridge()
 
     _load_settings()
