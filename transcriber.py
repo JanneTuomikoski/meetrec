@@ -221,7 +221,8 @@ class RealtimeTranscriptionSession:
             speech_model=SpeechModel.u3_rt_pro,
         )
         self._client.connect(params=params)
-        self._connected.wait(timeout=10.0)
+        if not self._connected.wait(timeout=10.0):
+            log.error("Streaming connection timed out after 10s")
 
     def start(self, sample_rate: int = 16000):
         self._sample_rate = sample_rate

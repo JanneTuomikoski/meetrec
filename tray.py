@@ -67,6 +67,8 @@ def _load_settings():
             _realtime_mode        = s.get("realtime_mode", False)
             recorder.mic_name     = s.get("mic_name")
             recorder.speaker_name = s.get("speaker_name")
+            recorder.mic_boost    = s.get("mic_boost", 1.3)
+            recorder.sys_boost    = s.get("sys_boost", 0.8)
             _obsidian_vault       = s.get("obsidian_vault")
             log.info("Settings loaded")
     except Exception as e:
@@ -80,6 +82,8 @@ def _save_settings():
             "realtime_mode":    _realtime_mode,
             "mic_name":         recorder.mic_name,
             "speaker_name":     recorder.speaker_name,
+            "mic_boost":        recorder.mic_boost,
+            "sys_boost":        recorder.sys_boost,
             "obsidian_vault":   _obsidian_vault,
         }, indent=2), encoding="utf-8")
     except Exception as e:
@@ -142,12 +146,12 @@ def _open_in_obsidian(dest: "Path"):
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _recording_count() -> int:
-    return len(list(AUDIO_DIR.glob("*.mp3")))
+    return sum(len(list(AUDIO_DIR.glob(f"*.{ext}"))) for ext in ("mp3", "flac"))
 
 
 def _recent_recordings(n: int = 5) -> list[Path]:
-    mp3s = list(AUDIO_DIR.glob("*.mp3"))
-    return sorted(mp3s, key=lambda p: p.stat().st_mtime, reverse=True)[:n]
+    files = list(AUDIO_DIR.glob("*.mp3")) + list(AUDIO_DIR.glob("*.flac"))
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:n]
 
 
 # ── Icon drawing ───────────────────────────────────────────────────────────
@@ -186,12 +190,14 @@ threading.Thread(target=_tooltip_loop, daemon=True).start()
 # ── Windows toast notification ─────────────────────────────────────────────
 
 def notify(title: str, message: str):
+    safe_title = title.replace("'", "''")
+    safe_msg   = message.replace("'", "''")
     ps = f"""
     Add-Type -AssemblyName System.Windows.Forms
     $n = New-Object System.Windows.Forms.NotifyIcon
     $n.Icon = [System.Drawing.SystemIcons]::Information
     $n.Visible = $true
-    $n.ShowBalloonTip(4000, '{title}', '{message}', [System.Windows.Forms.ToolTipIcon]::None)
+    $n.ShowBalloonTip(4000, '{safe_title}', '{safe_msg}', [System.Windows.Forms.ToolTipIcon]::None)
     Start-Sleep -Milliseconds 4500
     $n.Dispose()
     """
@@ -213,6 +219,7 @@ class UIBridge(QObject):
     _request_context_rt  = Signal(str, str)   # mp3 path, realtime transcript
     _open_live_window    = Signal()
     _close_live_window   = Signal()
+    _do_quit             = Signal()
 
     def __init__(self):
         super().__init__()
@@ -222,6 +229,10 @@ class UIBridge(QObject):
         self._request_context_rt.connect(self._do_show_context_rt)
         self._open_live_window.connect(self._do_open_live_window)
         self._close_live_window.connect(self._do_close_live_window)
+        self._do_quit.connect(QApplication.instance().quit)
+
+    def request_quit(self):
+        self._do_quit.emit()
 
     # Called from any thread — safely
     def open_file_and_transcribe(self):
@@ -262,7 +273,7 @@ class UIBridge(QObject):
             None,
             "Select a recording to transcribe",
             str(AUDIO_DIR),
-            "MP3 files (*.mp3);;All files (*.*)",
+            "Audio files (*.mp3 *.flac);;All files (*.*)",
         )
         if path:
             self._do_show_context(path)
@@ -279,44 +290,12 @@ class UIBridge(QObject):
                 _tray_icon.update_menu()
 
     def _do_show_context(self, mp3_path: str):
-        global _status
-        stem    = Path(mp3_path).stem.replace("meeting_", "").replace("_", " ")
-        context = ask_meeting_context(default_title=stem)
-
-        if context is None:
-            log.info("Transcription cancelled by user.")
-            _status = "idle"
-            if _tray_icon:
-                _tray_icon.icon = make_icon("idle")
-                _tray_icon.update_menu()
-            return
-
-        # Check for existing notes and ask what to do
-        notes_file = NOTES_DIR / f"{Path(mp3_path).stem}_notes.md"
-        notes_mode = "overwrite"
-        existing_notes = ""
-        if notes_file.exists():
-            notes_mode = ask_notes_conflict(str(notes_file))
-            if notes_mode is None:
-                log.info("Notes conflict cancelled by user.")
-                _status = "idle"
-                if _tray_icon:
-                    _tray_icon.icon = make_icon("idle")
-                    _tray_icon.update_menu()
-                return
-            if notes_mode in ("append", "improve"):
-                existing_notes = notes_file.read_text(encoding="utf-8")
-
-        _status = "processing"
-        if _tray_icon:
-            _tray_icon.icon = make_icon("processing")
-            _tray_icon.update_menu()
-
-        threading.Thread(
-            target=_pipeline, args=(mp3_path, context, notes_mode, existing_notes), daemon=True
-        ).start()
+        self._run_context_flow(mp3_path)
 
     def _do_show_context_rt(self, mp3_path: str, realtime_transcript: str):
+        self._run_context_flow(mp3_path, realtime_transcript)
+
+    def _run_context_flow(self, mp3_path: str, realtime_transcript: str | None = None):
         global _status
         stem    = Path(mp3_path).stem.replace("meeting_", "").replace("_", " ")
         context = ask_meeting_context(default_title=stem)
@@ -329,7 +308,6 @@ class UIBridge(QObject):
                 _tray_icon.update_menu()
             return
 
-        # Check for existing notes and ask what to do
         notes_file = NOTES_DIR / f"{Path(mp3_path).stem}_notes.md"
         notes_mode = "overwrite"
         existing_notes = ""
@@ -350,11 +328,16 @@ class UIBridge(QObject):
             _tray_icon.icon = make_icon("processing")
             _tray_icon.update_menu()
 
-        threading.Thread(
-            target=_pipeline_rt,
-            args=(mp3_path, realtime_transcript, context, notes_mode, existing_notes),
-            daemon=True,
-        ).start()
+        if realtime_transcript is not None:
+            threading.Thread(
+                target=_pipeline_rt,
+                args=(mp3_path, realtime_transcript, context, notes_mode, existing_notes),
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(
+                target=_pipeline, args=(mp3_path, context, notes_mode, existing_notes), daemon=True
+            ).start()
 
 
 # ── Transcription pipeline (worker thread) ─────────────────────────────────
@@ -641,6 +624,49 @@ def spk_submenu():
     )
 
 
+# ── Boost selection ───────────────────────────────────────────────────────
+
+_BOOST_LEVELS = [0.5, 0.8, 1.0, 1.3, 1.5, 2.0]
+
+
+def set_mic_boost(level):
+    def _set(icon, _item):
+        recorder.mic_boost = level
+        log.info(f"Mic boost set to: {level}x")
+        _save_settings()
+        icon.update_menu()
+    return _set
+
+
+def set_sys_boost(level):
+    def _set(icon, _item):
+        recorder.sys_boost = level
+        log.info(f"System boost set to: {level}x")
+        _save_settings()
+        icon.update_menu()
+    return _set
+
+
+def mic_boost_submenu():
+    return pystray.Menu(*[
+        item(
+            f"{'✔  ' if recorder.mic_boost == lvl else '     '}{lvl}x",
+            set_mic_boost(lvl),
+        )
+        for lvl in _BOOST_LEVELS
+    ])
+
+
+def sys_boost_submenu():
+    return pystray.Menu(*[
+        item(
+            f"{'✔  ' if recorder.sys_boost == lvl else '     '}{lvl}x",
+            set_sys_boost(lvl),
+        )
+        for lvl in _BOOST_LEVELS
+    ])
+
+
 # ── Recordings submenu ─────────────────────────────────────────────────────
 
 def recordings_submenu():
@@ -675,10 +701,14 @@ def open_folder(path):
 def on_quit(icon, _item):
     log.info("MeetRec quit")
     _stop_tooltip.set()
-    if _status == "recording":
-        recorder.stop()
-    icon.stop()
-    QApplication.instance().quit()
+    icon.stop()     # Remove from tray immediately so the UI feels responsive
+
+    def _shutdown():
+        if _status == "recording":
+            recorder.stop()     # May block while ffmpeg encodes — fine in background
+        _bridge.request_quit()  # Dispatches to Qt main thread via signal
+
+    threading.Thread(target=_shutdown, daemon=True).start()
 
 
 # ── Menu ───────────────────────────────────────────────────────────────────
@@ -708,6 +738,8 @@ def settings_submenu():
         pystray.Menu.SEPARATOR,
         item("🎙️  Microphone", pystray.Menu(mic_submenu)),
         item("🔊  Loopback",   pystray.Menu(spk_submenu)),
+        item(lambda _: f"🎙️  Mic boost  {recorder.mic_boost}x",  pystray.Menu(mic_boost_submenu)),
+        item(lambda _: f"🔊  Sys boost  {recorder.sys_boost}x",  pystray.Menu(sys_boost_submenu)),
         pystray.Menu.SEPARATOR,
         item(lambda _: f"📗  Obsidian vault  {'✔' if _obsidian_vault and os.path.isdir(_obsidian_vault) else ''}",
              pystray.Menu(obsidian_submenu)),

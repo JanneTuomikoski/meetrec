@@ -4,10 +4,10 @@ Handles mic + system loopback recording with auto sample-rate detection
 and optional device selection.
 """
 
-from pydub import AudioSegment
 from scipy.signal import resample_poly
 import soundcard as sc
 import soundfile as sf
+import subprocess
 import numpy as np
 import threading
 import datetime
@@ -62,6 +62,8 @@ class Recorder:
         self.output_dir    = output_dir
         self.mic_name      = None   # None = use default
         self.speaker_name  = None   # None = use default
+        self.mic_boost     = 1.3
+        self.sys_boost     = 0.8
         self.on_audio_chunk = None  # Callable[[bytes], None] for real-time streaming
         self._stop_event   = threading.Event()
         self._mic_chunks: list = []
@@ -69,6 +71,8 @@ class Recorder:
         self._mic_rate     = OUTPUT_RATE
         self._sys_rate     = 48000
         self._mix_thread   = None
+        self._mic_thread   = None   # kept to join before saving
+        self._sys_thread   = None
 
     def start(self):
         """Begin recording. Blocks until stop() is called."""
@@ -123,13 +127,20 @@ class Recorder:
                 try:
                     mic_c = mic_q.get(timeout=0.6)
                 except queue.Empty:
+                    if self._stop_event.is_set():
+                        while not sys_q.empty():
+                            try:
+                                sys_q.get_nowait()
+                            except queue.Empty:
+                                break
+                        break
                     continue
                 try:
                     sys_c = sys_q.get(timeout=0.1)
                 except queue.Empty:
                     sys_c = np.zeros_like(mic_c)
                 min_len = min(len(mic_c), len(sys_c))
-                mixed = (mic_c[:min_len] * 1.3) + (sys_c[:min_len] * 0.8)
+                mixed = (mic_c[:min_len] * self.mic_boost) + (sys_c[:min_len] * self.sys_boost)
                 peak = np.max(np.abs(mixed))
                 if peak > 0:
                     mixed = mixed / peak * 0.95
@@ -140,6 +151,8 @@ class Recorder:
 
         mic_t = threading.Thread(target=record_mic, daemon=True)
         sys_t = threading.Thread(target=record_sys,  daemon=True)
+        self._mic_thread = mic_t
+        self._sys_thread = sys_t
         mic_t.start()
         sys_t.start()
 
@@ -157,23 +170,32 @@ class Recorder:
     def stop(self) -> str | None:
         """Stop recording, mix and save MP3. Returns path or None."""
         self._stop_event.set()
+        # Wait for recording threads to finish their current read before touching chunks
+        for t in (self._mic_thread, self._sys_thread):
+            if t and t.is_alive():
+                t.join(timeout=2.0)
 
-        if not self._mic_chunks or not self._sys_chunks:
+        if not self._mic_chunks and not self._sys_chunks:
             log.warning("Recording stopped but no audio was captured.")
             return None
 
         try:
-            mic_audio = np.concatenate(self._mic_chunks, axis=0)
-            sys_audio = np.concatenate(self._sys_chunks, axis=0)
+            mic_audio = np.concatenate(self._mic_chunks, axis=0) if self._mic_chunks else None
+            sys_audio = np.concatenate(self._sys_chunks, axis=0) if self._sys_chunks else None
 
-            mic_mono = mic_audio[:, 0] if mic_audio.ndim > 1 else mic_audio
-            sys_mono = sys_audio.mean(axis=1) if sys_audio.ndim > 1 else sys_audio
+            mic_mono = (mic_audio[:, 0] if mic_audio.ndim > 1 else mic_audio) if mic_audio is not None else None
+            sys_mono = (sys_audio.mean(axis=1) if sys_audio.ndim > 1 else sys_audio) if sys_audio is not None else None
 
-            mic_rs = _resample(mic_mono, self._mic_rate, OUTPUT_RATE)
-            sys_rs = _resample(sys_mono, self._sys_rate, OUTPUT_RATE)
+            mic_rs = _resample(mic_mono, self._mic_rate, OUTPUT_RATE) if mic_mono is not None else None
+            sys_rs = _resample(sys_mono, self._sys_rate, OUTPUT_RATE) if sys_mono is not None else None
 
-            min_len = min(len(mic_rs), len(sys_rs))
-            mixed   = (mic_rs[:min_len] * 1.3) + (sys_rs[:min_len] * 0.8)
+            if mic_rs is not None and sys_rs is not None:
+                min_len = min(len(mic_rs), len(sys_rs))
+                mixed   = (mic_rs[:min_len] * self.mic_boost) + (sys_rs[:min_len] * self.sys_boost)
+            elif mic_rs is not None:
+                mixed = mic_rs * self.mic_boost
+            else:
+                mixed = sys_rs * self.sys_boost
 
             peak = np.max(np.abs(mixed))
             if peak > 0:
@@ -184,11 +206,23 @@ class Recorder:
             mp3_path  = os.path.join(self.output_dir, f"meeting_{timestamp}.mp3")
 
             sf.write(temp_wav, mixed, OUTPUT_RATE)
-            AudioSegment.from_wav(temp_wav).export(mp3_path, format="mp3", bitrate="128k")
-            os.remove(temp_wav)
 
-            log.info(f"Recording saved: {mp3_path}")
-            return mp3_path
+            result = subprocess.run(
+                ['ffmpeg', '-y', '-i', temp_wav, '-b:a', '64k', mp3_path],
+                capture_output=True, timeout=120,
+            )
+            if result.returncode == 0:
+                os.remove(temp_wav)
+                log.info(f"Recording saved: {mp3_path}")
+                return mp3_path
+
+            stderr = result.stderr.decode(errors='replace').strip()
+            log.warning(f"MP3 encoding failed (exit {result.returncode}): {stderr or '(no output)'}")
+            flac_path = mp3_path.replace('.mp3', '.flac')
+            sf.write(flac_path, mixed, OUTPUT_RATE, format='FLAC', subtype='PCM_16')
+            os.remove(temp_wav)
+            log.info(f"Recording saved (FLAC fallback): {flac_path}")
+            return flac_path
 
         except Exception as e:
             log.error(f"Failed to save recording: {e}")
