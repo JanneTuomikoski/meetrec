@@ -86,6 +86,9 @@ class AudioMeterWidget(QWidget):
         self._timer.timeout.connect(self._decay_tick)
         self._timer.start(50)
 
+    def stop(self):
+        self._timer.stop()
+
     def set_mic(self, rms: float):
         val = min(rms * self._SCALE, 1.0)
         self._mic = val
@@ -157,7 +160,7 @@ class AudioMeterWidget(QWidget):
                 painter.drawRoundedRect(bar_x, cy - bar_h // 2, fill_w, bar_h, 3, 3)
 
             # Peak line
-            peak_x = bar_x + int(bar_w * peak)
+            peak_x = bar_x + min(int(bar_w * peak), bar_w - 1)
             if peak_x > bar_x:
                 painter.setPen(QPen(_PEAK, 2))
                 painter.drawLine(peak_x, cy - bar_h // 2, peak_x, cy + bar_h // 2)
@@ -244,5 +247,5 @@ class LevelMeterWindow(QWidget):
 
     def close_window(self):
         self._timer.stop()
-        self._meter._timer.stop()
+        self._meter.stop()
         self.close()
