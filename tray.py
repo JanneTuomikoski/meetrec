@@ -194,7 +194,7 @@ threading.Thread(target=_tooltip_loop, daemon=True).start()
 
 def notify(title: str, message: str):
     safe_title = title.replace("'", "''")
-    safe_msg   = message.replace("'", "''")
+    safe_msg   = message.replace("'", "''").replace('\n', ' ')
     ps = f"""
     Add-Type -AssemblyName System.Windows.Forms
     $n = New-Object System.Windows.Forms.NotifyIcon
@@ -271,6 +271,12 @@ class UIBridge(QObject):
     def _do_open_live_window(self):
         global _live_window
         _live_window = LiveTranscriptWindow()
+        try:
+            _live_bridge._update_partial.disconnect()
+            _live_bridge._commit_final.disconnect()
+            _live_bridge._close_window.disconnect()
+        except RuntimeError:
+            pass
         _live_bridge._update_partial.connect(_live_window.on_partial)
         _live_bridge._commit_final.connect(_live_window.on_final)
         _live_bridge._close_window.connect(_live_window.close_window)
@@ -284,6 +290,12 @@ class UIBridge(QObject):
     def _do_open_level_window(self):
         global _level_window
         _level_window = LevelMeterWindow()
+        try:
+            _level_bridge._mic_level.disconnect()
+            _level_bridge._sys_level.disconnect()
+            _level_bridge._close_window.disconnect()
+        except RuntimeError:
+            pass
         _level_bridge._mic_level.connect(_level_window.set_mic)
         _level_bridge._sys_level.connect(_level_window.set_sys)
         _level_bridge._close_window.connect(_level_window.close_window)
@@ -482,7 +494,7 @@ def start_recording(icon, _item):
             on_partial=_live_bridge.update_partial,
             on_final=_on_final_with_save,
         )
-        _realtime_session.start()
+        threading.Thread(target=_realtime_session.start, daemon=True).start()
         recorder.on_audio_chunk = _realtime_session.send_chunk
         _bridge.open_live_window()
     else:

@@ -160,6 +160,9 @@ Transcript:
         messages=[{"role": "user", "content": prompt}]
     )
 
+    if not response.content:
+        log.error("Claude returned empty content")
+        return ""
     notes = response.content[0].text
     log.info("Notes generated successfully")
     return notes
@@ -206,6 +209,11 @@ class RealtimeTranscriptionSession:
         try:
             self._connected.clear()
             self._do_connect()
+            if self._stop_requested:
+                if self._client:
+                    self._client.disconnect(terminate=True)
+                    self._client = None
+                return
             log.info("Reconnected to streaming API")
         except Exception as e:
             log.error(f"Reconnect failed: {e}")
