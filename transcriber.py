@@ -156,7 +156,7 @@ Transcript:
 
     response = claude.messages.create(
         model="claude-opus-4-6",
-        max_tokens=2000,
+        max_tokens=16000,
         messages=[{"role": "user", "content": prompt}]
     )
 

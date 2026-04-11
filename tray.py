@@ -216,15 +216,17 @@ def notify(title: str, message: str):
 class UIBridge(QObject):
     """Receives signals from tray/worker threads and runs Qt UI on main thread."""
 
-    _request_file_pick   = Signal()
-    _request_vault_pick  = Signal()
-    _request_context     = Signal(str)        # mp3 path
-    _request_context_rt  = Signal(str, str)   # mp3 path, realtime transcript
-    _open_live_window    = Signal()
-    _close_live_window   = Signal()
-    _open_level_window   = Signal()
-    _close_level_window  = Signal()
-    _do_quit             = Signal()
+    _request_file_pick       = Signal()
+    _request_vault_pick      = Signal()
+    _request_context         = Signal(str)        # mp3 path
+    _request_context_rt      = Signal(str, str)   # mp3 path, realtime transcript
+    _request_transcript_pick = Signal()
+    _request_notes_from_tx   = Signal(str)        # transcript path
+    _open_live_window        = Signal()
+    _close_live_window       = Signal()
+    _open_level_window       = Signal()
+    _close_level_window      = Signal()
+    _do_quit                 = Signal()
 
     def __init__(self):
         super().__init__()
@@ -232,6 +234,8 @@ class UIBridge(QObject):
         self._request_vault_pick.connect(self._do_vault_pick)
         self._request_context.connect(self._do_show_context)
         self._request_context_rt.connect(self._do_show_context_rt)
+        self._request_transcript_pick.connect(self._do_transcript_pick)
+        self._request_notes_from_tx.connect(self._do_notes_from_transcript)
         self._open_live_window.connect(self._do_open_live_window)
         self._close_live_window.connect(self._do_close_live_window)
         self._open_level_window.connect(self._do_open_level_window)
@@ -244,6 +248,12 @@ class UIBridge(QObject):
     # Called from any thread — safely
     def open_file_and_transcribe(self):
         self._request_file_pick.emit()
+
+    def open_transcript_and_notes(self):
+        self._request_transcript_pick.emit()
+
+    def redo_notes_from_transcript(self, transcript_path: str):
+        self._request_notes_from_tx.emit(transcript_path)
 
     def pick_obsidian_vault(self):
         self._request_vault_pick.emit()
@@ -315,6 +325,50 @@ class UIBridge(QObject):
         )
         if path:
             self._do_show_context(path)
+
+    def _do_transcript_pick(self):
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Select a transcript to regenerate notes from",
+            str(TRANSCRIPT_DIR),
+            "Transcript files (*.txt);;All files (*.*)",
+        )
+        if path:
+            self._do_notes_from_transcript(path)
+
+    def _do_notes_from_transcript(self, transcript_path: str):
+        self._run_notes_flow(transcript_path)
+
+    def _run_notes_flow(self, transcript_path: str):
+        global _status
+        stem = Path(transcript_path).stem.replace("_transcript", "").replace("meeting_", "").replace("_", " ")
+        context = ask_meeting_context(default_title=stem)
+
+        if context is None:
+            log.info("Notes regeneration cancelled by user.")
+            return
+
+        notes_file = NOTES_DIR / f"{Path(transcript_path).stem.replace('_transcript', '')}_notes.md"
+        notes_mode = "overwrite"
+        existing_notes = ""
+        if notes_file.exists():
+            notes_mode = ask_notes_conflict(str(notes_file))
+            if notes_mode is None:
+                log.info("Notes conflict cancelled by user.")
+                return
+            if notes_mode in ("append", "improve"):
+                existing_notes = notes_file.read_text(encoding="utf-8")
+
+        _status = "processing"
+        if _tray_icon:
+            _tray_icon.icon = make_icon("processing")
+            _tray_icon.update_menu()
+
+        threading.Thread(
+            target=_pipeline_notes_only,
+            args=(transcript_path, str(notes_file), context, notes_mode, existing_notes),
+            daemon=True,
+        ).start()
 
     def _do_vault_pick(self):
         global _obsidian_vault
@@ -466,6 +520,50 @@ def _pipeline_rt(mp3_path: str, realtime_transcript: str, context,
             _tray_icon.update_menu()
 
 
+def _pipeline_notes_only(transcript_path: str, notes_file: str, context,
+                         notes_mode: str = "overwrite", existing_notes: str = ""):
+    global _status
+    try:
+        raw_text = Path(transcript_path).read_text(encoding="utf-8")
+        log.info(f"Regenerating notes from transcript: {transcript_path}")
+
+        if notes_mode == "append":
+            notes = generate_notes(raw_text, context=context)
+            if context and context.title:
+                notes = f"# {context.title}\n\n{notes}"
+            if existing_notes:
+                notes = existing_notes + "\n\n---\n\n" + notes
+        elif notes_mode == "improve":
+            notes = generate_notes(raw_text, context=context, existing_notes=existing_notes)
+            if context and context.title and not notes.startswith("#"):
+                notes = f"# {context.title}\n\n{notes}"
+        else:
+            notes = generate_notes(raw_text, context=context)
+            if context and context.title:
+                notes = f"# {context.title}\n\n{notes}"
+
+        with open(notes_file, "w", encoding="utf-8") as f:
+            f.write(notes)
+        log.info(f"Notes saved: {notes_file}")
+
+        stem = Path(notes_file).stem.replace("_notes", "")
+        obsidian_dest = _copy_to_obsidian(notes_file, stem, context)
+
+        notify("MeetRec", "✅ Notes ready!")
+        if obsidian_dest:
+            _open_in_obsidian(obsidian_dest)
+        elif os.path.exists(notes_file):
+            os.startfile(notes_file)
+    except Exception as e:
+        log.error(f"Notes-only pipeline failed: {e}")
+        notify("MeetRec", f"❌ Notes failed: {e}")
+    finally:
+        _status = "idle"
+        if _tray_icon:
+            _tray_icon.icon = make_icon("idle")
+            _tray_icon.update_menu()
+
+
 # ── Recording actions ──────────────────────────────────────────────────────
 
 def start_recording(icon, _item):
@@ -573,6 +671,43 @@ def transcribe_specific(mp3_path: str):
         icon.update_menu()
         _bridge.show_context_and_transcribe(mp3_path)
     return _do
+
+
+def redo_notes_from_file(icon, _item):
+    if _status != "idle":
+        return
+    _bridge.open_transcript_and_notes()
+
+
+def redo_notes_specific(transcript_path: str):
+    def _do(icon, _item):
+        if _status != "idle":
+            return
+        _bridge.redo_notes_from_transcript(transcript_path)
+    return _do
+
+
+def _recent_transcripts(n: int = 5) -> list[Path]:
+    files = list(TRANSCRIPT_DIR.glob("*_transcript.txt"))
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:n]
+
+
+def recent_transcripts_submenu():
+    recent = _recent_transcripts(5)
+    if not recent:
+        return pystray.Menu(
+            item("  No transcripts yet", lambda *_: None, enabled=lambda _: False)
+        )
+    entries = []
+    for p in recent:
+        name = p.stem.replace("_transcript", "").replace("meeting_", "")
+        parts = name.split("_")
+        if len(parts) >= 2:
+            label = f"{parts[0]}  {parts[1].replace('-', ':')[:5]}"
+        else:
+            label = p.stem
+        entries.append(item(f"  {label}", redo_notes_specific(str(p))))
+    return pystray.Menu(*entries)
 
 
 def set_obsidian_vault(icon, _item):
@@ -805,6 +940,11 @@ def build_menu():
         item("📂  Transcribe a file…", transcribe_file,
              enabled=lambda _: _status == "idle"),
         item("📼  Recent recordings",  pystray.Menu(recordings_submenu),
+             enabled=lambda _: _status == "idle"),
+        pystray.Menu.SEPARATOR,
+        item("🔄  Redo notes from transcript…", redo_notes_from_file,
+             enabled=lambda _: _status == "idle"),
+        item("📋  Recent transcripts", pystray.Menu(recent_transcripts_submenu),
              enabled=lambda _: _status == "idle"),
         pystray.Menu.SEPARATOR,
         item("⚙️  Settings", pystray.Menu(settings_submenu)),
