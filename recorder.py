@@ -68,6 +68,7 @@ class Recorder:
         self.on_mic_level  = None   # Callable[[float], None] RMS level 0–1
         self.on_sys_level  = None   # Callable[[float], None] RMS level 0–1
         self._stop_event   = threading.Event()
+        self._chunks_lock  = threading.Lock()
         self._mic_chunks: list = []
         self._sys_chunks: list = []
         self._mic_rate     = OUTPUT_RATE
@@ -105,7 +106,8 @@ class Recorder:
                 with mic.recorder(samplerate=self._mic_rate, channels=1) as rec:
                     while not self._stop_event.is_set():
                         data = rec.record(numframes=int(self._mic_rate * CHUNK_DURATION))
-                        self._mic_chunks.append(data)
+                        with self._chunks_lock:
+                            self._mic_chunks.append(data)
                         mono = data[:, 0] if data.ndim > 1 else data
                         if self.on_mic_level:
                             self.on_mic_level(float(np.sqrt(np.mean(mono ** 2))))
@@ -119,7 +121,8 @@ class Recorder:
                 with loopback.recorder(samplerate=self._sys_rate, channels=2) as rec:
                     while not self._stop_event.is_set():
                         data = rec.record(numframes=int(self._sys_rate * CHUNK_DURATION))
-                        self._sys_chunks.append(data)
+                        with self._chunks_lock:
+                            self._sys_chunks.append(data)
                         mono = data.mean(axis=1) if data.ndim > 1 else data
                         if self.on_sys_level:
                             self.on_sys_level(float(np.sqrt(np.mean(mono ** 2))))
@@ -186,8 +189,11 @@ class Recorder:
             return None
 
         try:
-            mic_audio = np.concatenate(self._mic_chunks, axis=0) if self._mic_chunks else None
-            sys_audio = np.concatenate(self._sys_chunks, axis=0) if self._sys_chunks else None
+            with self._chunks_lock:
+                mic_chunks = list(self._mic_chunks)
+                sys_chunks = list(self._sys_chunks)
+            mic_audio = np.concatenate(mic_chunks, axis=0) if mic_chunks else None
+            sys_audio = np.concatenate(sys_chunks, axis=0) if sys_chunks else None
 
             mic_mono = (mic_audio[:, 0] if mic_audio.ndim > 1 else mic_audio) if mic_audio is not None else None
             sys_mono = (sys_audio.mean(axis=1) if sys_audio.ndim > 1 else sys_audio) if sys_audio is not None else None
