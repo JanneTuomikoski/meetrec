@@ -270,6 +270,14 @@ class RealtimeTranscriptionSession:
         if self._client:
             self._client.disconnect(terminate=True)
             self._client = None
+        # The server flushes remaining audio as a final turn on terminate;
+        # that event can still be in flight when disconnect returns. Wait
+        # until no new finals arrive (max 2s) before joining the transcript.
+        deadline = time.time() + 2.0
+        last_count = -1
+        while time.time() < deadline and len(self._finals) != last_count:
+            last_count = len(self._finals)
+            time.sleep(0.25)
         result = " ".join(self._finals)
         self._pending_chunks.clear()
         log.info(f"Realtime transcription complete: {len(self._finals)} utterances")
