@@ -5,6 +5,7 @@ and optional device selection.
 """
 
 from scipy.signal import resample_poly
+import soundcard_patch  # noqa: F401 — must be imported so soundcard accepts non-extensible mix formats
 import soundcard as sc
 import soundfile as sf
 import subprocess
@@ -30,24 +31,32 @@ def list_speakers() -> list[str]:
 
 
 def get_mic_samplerate(device) -> int:
+    last_error = None
     for rate in [16000, 48000, 44100, 32000, 8000]:
         try:
             with device.recorder(samplerate=rate, channels=1) as r:
                 r.record(numframes=1)
             return rate
-        except Exception:
+        except Exception as e:
+            last_error = e
             continue
+    log.warning(f"Mic '{device.name}' failed at every sample rate "
+                f"({type(last_error).__name__}: {last_error}); defaulting to 48000Hz")
     return 48000
 
 
 def get_sys_samplerate(device) -> int:
+    last_error = None
     for rate in [48000, 44100, 16000, 32000, 8000]:
         try:
             with device.recorder(samplerate=rate, channels=2) as r:
                 r.record(numframes=1)
             return rate
-        except Exception:
+        except Exception as e:
+            last_error = e
             continue
+    log.warning(f"Loopback '{device.name}' failed at every sample rate "
+                f"({type(last_error).__name__}: {last_error}); defaulting to 48000Hz")
     return 48000
 
 
@@ -69,6 +78,7 @@ class Recorder:
         self.on_mic_level  = None   # Callable[[float], None] RMS level 0–1
         self.on_sys_level  = None   # Callable[[float], None] RMS level 0–1
         self.on_start_failed = None
+        self.on_capture_error = None  # Callable[[str], None] a capture thread died
         self._stop_event   = threading.Event()
         self._chunks_lock  = threading.Lock()
         self._mic_chunks: list = []
@@ -122,7 +132,9 @@ class Recorder:
                         if streaming:
                             mic_q.put(_resample(mono, self._mic_rate, OUTPUT_RATE))
             except Exception as e:
-                log.error(f"Mic recording error: {e}")
+                log.error(f"Mic recording error: {type(e).__name__}: {e}")
+                if self.on_capture_error:
+                    self.on_capture_error("Microphone capture failed — recording continues without your voice!")
 
         def record_sys():
             try:
@@ -137,7 +149,9 @@ class Recorder:
                         if streaming:
                             sys_q.put(_resample(mono, self._sys_rate, OUTPUT_RATE))
             except Exception as e:
-                log.error(f"System audio recording error: {e}")
+                log.error(f"System audio recording error: {type(e).__name__}: {e}")
+                if self.on_capture_error:
+                    self.on_capture_error("System audio capture failed — recording continues without the other participants!")
 
         def mix_and_stream():
             while not self._stop_event.is_set() or not mic_q.empty():

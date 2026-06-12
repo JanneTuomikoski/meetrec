@@ -556,6 +556,7 @@ def _handle_recording_start_failed(message: str):
     recorder.on_mic_level = None
     recorder.on_sys_level = None
     recorder.on_start_failed = None
+    recorder.on_capture_error = None
 
     if _bridge:
         _bridge.close_level_window()
@@ -610,6 +611,7 @@ def start_recording(icon, _item):
     recorder.on_mic_level = _level_bridge.update_mic
     recorder.on_sys_level = _level_bridge.update_sys
     recorder.on_start_failed = _handle_recording_start_failed
+    recorder.on_capture_error = lambda msg: notify("MeetRec", f"⚠️ {msg}")
     _bridge.open_level_window()
 
     threading.Thread(target=recorder.start, daemon=True).start()
@@ -635,6 +637,7 @@ def _finish_recording(icon):
     mp3 = recorder.stop()
     _last_mp3 = mp3
     recorder.on_start_failed = None
+    recorder.on_capture_error = None
 
     recorder.on_mic_level = None
     recorder.on_sys_level = None
