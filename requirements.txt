@@ -1,0 +1,11 @@
+anthropic
+assemblyai
+numpy
+pillow
+pystray
+PySide6
+python-dotenv
+pywin32
+scipy
+soundcard @ git+https://github.com/bastibe/SoundCard.git
+soundfile

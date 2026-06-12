@@ -15,6 +15,7 @@ import queue
 import os
 
 from logger import log
+from audio_mix import mix_mono_tracks
 
 CHUNK_DURATION = 0.5    # seconds per read chunk
 OUTPUT_RATE    = 16000  # 16k mono is ideal for AssemblyAI
@@ -201,17 +202,10 @@ class Recorder:
             mic_rs = _resample(mic_mono, self._mic_rate, OUTPUT_RATE) if mic_mono is not None else None
             sys_rs = _resample(sys_mono, self._sys_rate, OUTPUT_RATE) if sys_mono is not None else None
 
-            if mic_rs is not None and sys_rs is not None:
-                min_len = min(len(mic_rs), len(sys_rs))
-                mixed   = (mic_rs[:min_len] * self.mic_boost) + (sys_rs[:min_len] * self.sys_boost)
-            elif mic_rs is not None:
-                mixed = mic_rs * self.mic_boost
-            else:
-                mixed = sys_rs * self.sys_boost
-
-            peak = np.max(np.abs(mixed))
-            if peak > 0:
-                mixed = mixed / peak * 0.95
+            mixed = mix_mono_tracks(mic_rs, sys_rs, self.mic_boost, self.sys_boost)
+            if mixed is None:
+                log.warning("Recording stopped but no mixable audio was captured.")
+                return None
 
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             temp_wav  = os.path.join(self.output_dir, f"meeting_{timestamp}_temp.wav")

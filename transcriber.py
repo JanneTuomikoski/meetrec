@@ -21,6 +21,7 @@ from assemblyai.streaming.v3 import (
 import anthropic
 
 from logger import log
+from notes import build_notes
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -273,20 +274,13 @@ def process_meeting(mp3_path: str, transcript_dir: str, notes_dir: str, context=
         f.write(raw_text)
     log.info(f"Transcript saved: {transcript_file}")
 
-    if notes_mode == "append":
-        notes = generate_notes(raw_text, context=context)
-        if context and context.title:
-            notes = f"# {context.title}\n\n{notes}"
-        if existing_notes:
-            notes = existing_notes + "\n\n---\n\n" + notes
-    elif notes_mode == "improve":
-        notes = generate_notes(raw_text, context=context, existing_notes=existing_notes)
-        if context and context.title and not notes.startswith("#"):
-            notes = f"# {context.title}\n\n{notes}"
-    else:  # overwrite
-        notes = generate_notes(raw_text, context=context)
-        if context and context.title:
-            notes = f"# {context.title}\n\n{notes}"
+    notes = build_notes(
+        raw_text,
+        context=context,
+        notes_mode=notes_mode,
+        existing_notes=existing_notes,
+        notes_generator=generate_notes,
+    )
 
     with open(notes_file, "w", encoding="utf-8") as f:
         f.write(notes)

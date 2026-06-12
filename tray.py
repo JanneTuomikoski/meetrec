@@ -10,7 +10,6 @@ import json
 import threading
 import time
 import os
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,7 +20,7 @@ from pystray import MenuItem as item
 from PIL import Image, ImageDraw
 
 from PySide6.QtWidgets import QApplication, QFileDialog
-from PySide6.QtCore import QObject, Signal, QTimer, Qt
+from PySide6.QtCore import QObject, Signal, Qt
 
 from recorder import Recorder, list_microphones, list_speakers
 from transcriber import process_meeting, generate_notes, RealtimeTranscriptionSession
@@ -29,6 +28,9 @@ from context_dialog import ask_meeting_context, ask_notes_conflict
 from live_transcript_window import LiveTranscriptBridge, LiveTranscriptWindow
 from level_meter_window import LevelBridge, LevelMeterWindow
 from logger import log
+from filenames import obsidian_filename
+from notes import build_notes
+from settings_store import apply_settings, settings_payload
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR       = Path(__file__).parent
@@ -66,13 +68,7 @@ def _load_settings():
     try:
         if SETTINGS_FILE.exists():
             s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            _auto_transcribe      = s.get("auto_transcribe", False)
-            _realtime_mode        = s.get("realtime_mode", False)
-            recorder.mic_name     = s.get("mic_name")
-            recorder.speaker_name = s.get("speaker_name")
-            recorder.mic_boost    = s.get("mic_boost", 1.3)
-            recorder.sys_boost    = s.get("sys_boost", 0.8)
-            _obsidian_vault       = s.get("obsidian_vault")
+            _auto_transcribe, _realtime_mode, _obsidian_vault = apply_settings(s, recorder)
             log.info("Settings loaded")
     except Exception as e:
         log.error(f"Failed to load settings: {e}")
@@ -80,15 +76,8 @@ def _load_settings():
 
 def _save_settings():
     try:
-        SETTINGS_FILE.write_text(json.dumps({
-            "auto_transcribe":  _auto_transcribe,
-            "realtime_mode":    _realtime_mode,
-            "mic_name":         recorder.mic_name,
-            "speaker_name":     recorder.speaker_name,
-            "mic_boost":        recorder.mic_boost,
-            "sys_boost":        recorder.sys_boost,
-            "obsidian_vault":   _obsidian_vault,
-        }, indent=2), encoding="utf-8")
+        payload = settings_payload(_auto_transcribe, _realtime_mode, recorder, _obsidian_vault)
+        SETTINGS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception as e:
         log.error(f"Failed to save settings: {e}")
 
@@ -97,22 +86,7 @@ def _save_settings():
 
 def _obsidian_filename(mp3_stem: str, context) -> str:
     """Build a smart Obsidian filename from the recording stem and meeting context."""
-    # Extract date/time from stem: meeting_YYYY-MM-DD_HH-MM-SS
-    bare = mp3_stem.replace("meeting_", "")
-    parts = bare.split("_")
-    date_str = parts[0] if parts else time.strftime("%Y-%m-%d")
-    time_str = parts[1].replace("-", ":") if len(parts) > 1 else ""
-
-    if context and getattr(context, "title", None):
-        safe_title = re.sub(r'[\\/*?:"<>|]', "", context.title).strip()
-        return f"{date_str} {safe_title}.md"
-    elif context and getattr(context, "meeting_type", None):
-        mtype = context.meeting_type.capitalize()
-        suffix = f" {time_str[:5]}" if time_str else ""
-        return f"{date_str} {mtype}{suffix}.md"
-    else:
-        suffix = f" {time_str[:5]}" if time_str else ""
-        return f"{date_str} Meeting{suffix}.md"
+    return obsidian_filename(mp3_stem, context)
 
 
 def _copy_to_obsidian(notes_file: str, mp3_stem: str, context) -> "Path | None":
@@ -475,20 +449,13 @@ def _pipeline_rt(mp3_path: str, realtime_transcript: str, context,
             f.write(realtime_transcript)
         log.info(f"Realtime transcript saved: {transcript_file}")
 
-        if notes_mode == "append":
-            notes = generate_notes(realtime_transcript, context=context)
-            if context and context.title:
-                notes = f"# {context.title}\n\n{notes}"
-            if existing_notes:
-                notes = existing_notes + "\n\n---\n\n" + notes
-        elif notes_mode == "improve":
-            notes = generate_notes(realtime_transcript, context=context, existing_notes=existing_notes)
-            if context and context.title and not notes.startswith("#"):
-                notes = f"# {context.title}\n\n{notes}"
-        else:
-            notes = generate_notes(realtime_transcript, context=context)
-            if context and context.title:
-                notes = f"# {context.title}\n\n{notes}"
+        notes = build_notes(
+            realtime_transcript,
+            context=context,
+            notes_mode=notes_mode,
+            existing_notes=existing_notes,
+            notes_generator=generate_notes,
+        )
 
         with open(notes_file, "w", encoding="utf-8") as f:
             f.write(notes)
@@ -527,20 +494,13 @@ def _pipeline_notes_only(transcript_path: str, notes_file: str, context,
         raw_text = Path(transcript_path).read_text(encoding="utf-8")
         log.info(f"Regenerating notes from transcript: {transcript_path}")
 
-        if notes_mode == "append":
-            notes = generate_notes(raw_text, context=context)
-            if context and context.title:
-                notes = f"# {context.title}\n\n{notes}"
-            if existing_notes:
-                notes = existing_notes + "\n\n---\n\n" + notes
-        elif notes_mode == "improve":
-            notes = generate_notes(raw_text, context=context, existing_notes=existing_notes)
-            if context and context.title and not notes.startswith("#"):
-                notes = f"# {context.title}\n\n{notes}"
-        else:
-            notes = generate_notes(raw_text, context=context)
-            if context and context.title:
-                notes = f"# {context.title}\n\n{notes}"
+        notes = build_notes(
+            raw_text,
+            context=context,
+            notes_mode=notes_mode,
+            existing_notes=existing_notes,
+            notes_generator=generate_notes,
+        )
 
         with open(notes_file, "w", encoding="utf-8") as f:
             f.write(notes)

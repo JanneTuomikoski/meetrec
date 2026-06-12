@@ -6,9 +6,9 @@ System tray meeting recorder with automatic transcription and AI-generated notes
 
 1. **Install dependencies**
    ```
-   pip install pystray pillow python-dotenv pydub soundfile scipy assemblyai anthropic
-   pip install git+https://github.com/bastibe/SoundCard.git
+   pip install -r requirements.txt
    ```
+   Also install `ffmpeg` and make sure it is available on `PATH`.
 
 2. **Configure API keys**
    ```
