@@ -199,6 +199,7 @@ class Recorder:
             log.warning("Recording stopped but no audio was captured.")
             return None
 
+        temp_wav = None
         try:
             with self._chunks_lock:
                 mic_chunks = list(self._mic_chunks)
@@ -223,17 +224,23 @@ class Recorder:
 
             sf.write(temp_wav, mixed, OUTPUT_RATE)
 
-            result = subprocess.run(
-                ['ffmpeg', '-y', '-i', temp_wav, '-b:a', '64k', mp3_path],
-                capture_output=True, timeout=120,
-            )
-            if result.returncode == 0:
-                os.remove(temp_wav)
-                log.info(f"Recording saved: {mp3_path}")
-                return mp3_path
+            encode_error = ""
+            try:
+                result = subprocess.run(
+                    ['ffmpeg', '-y', '-i', temp_wav, '-b:a', '64k', mp3_path],
+                    capture_output=True, timeout=120,
+                )
+                if result.returncode == 0:
+                    os.remove(temp_wav)
+                    log.info(f"Recording saved: {mp3_path}")
+                    return mp3_path
+                stderr = result.stderr.decode(errors='replace').strip()
+                encode_error = f"exit {result.returncode}: {stderr or '(no output)'}"
+            except (subprocess.TimeoutExpired, OSError) as e:
+                # ffmpeg hung or isn't installed — the audio is still in memory
+                encode_error = str(e)
 
-            stderr = result.stderr.decode(errors='replace').strip()
-            log.warning(f"MP3 encoding failed (exit {result.returncode}): {stderr or '(no output)'}")
+            log.warning(f"MP3 encoding failed ({encode_error})")
             flac_path = mp3_path.replace('.mp3', '.flac')
             sf.write(flac_path, mixed, OUTPUT_RATE, format='FLAC', subtype='PCM_16')
             os.remove(temp_wav)
@@ -242,4 +249,6 @@ class Recorder:
 
         except Exception as e:
             log.error(f"Failed to save recording: {e}")
+            if temp_wav and os.path.exists(temp_wav):
+                log.error(f"Raw audio preserved at: {temp_wav}")
             return None
