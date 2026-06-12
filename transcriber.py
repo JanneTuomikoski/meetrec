@@ -163,9 +163,11 @@ Transcript:
     )
 
     if not response.content:
-        log.error("Claude returned empty content")
-        return ""
+        raise RuntimeError("Claude returned an empty response — no notes generated.")
     notes = response.content[0].text
+    if response.stop_reason == "max_tokens":
+        log.warning("Notes hit the max_tokens limit and were truncated")
+        notes += "\n\n> ⚠️ **Note:** these notes were cut off at the model's output limit and may be incomplete."
     log.info("Notes generated successfully")
     return notes
 
