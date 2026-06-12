@@ -593,12 +593,22 @@ def start_recording(icon, _item):
 
 
 def stop_recording(icon, _item):
-    global _status, _last_mp3, _realtime_session
+    global _status
     if _status != "recording":
         return
     log.info("Recording stopped")
-    _status = "idle"
-    icon.icon = make_icon("idle")
+    # Stay busy until the recording is saved — going idle here would let a new
+    # recording start and clear the chunk buffers while recorder.stop() is
+    # still mixing/encoding them. Saving also runs off the pystray callback
+    # thread so the menu stays responsive during ffmpeg encoding.
+    _status = "processing"
+    icon.icon = make_icon("processing")
+    icon.update_menu()
+    threading.Thread(target=_finish_recording, args=(icon,), daemon=True).start()
+
+
+def _finish_recording(icon):
+    global _status, _last_mp3, _realtime_session
     mp3 = recorder.stop()
     _last_mp3 = mp3
     recorder.on_start_failed = None
@@ -618,23 +628,23 @@ def stop_recording(icon, _item):
             realtime_transcript = None
             log.warning("Realtime transcript was empty; falling back to batch transcription.")
 
-    icon.update_menu()
-
     if not mp3:
+        _status = "idle"
+        icon.icon = make_icon("idle")
+        icon.update_menu()
         notify("MeetRec", "Recording failed — no audio captured.")
         return
 
     if realtime_transcript is not None:
-        _status = "processing"
-        icon.icon = make_icon("processing")
         icon.update_menu()
         _bridge.show_context_and_transcribe_rt(mp3, realtime_transcript)
     elif _auto_transcribe or realtime_fallback:
-        _status = "processing"
-        icon.icon = make_icon("processing")
         icon.update_menu()
         _bridge.show_context_and_transcribe(mp3)
     else:
+        _status = "idle"
+        icon.icon = make_icon("idle")
+        icon.update_menu()
         notify("MeetRec", "Recording saved.\nUse menu to transcribe.")
 
 
