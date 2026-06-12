@@ -526,6 +526,32 @@ def _pipeline_notes_only(transcript_path: str, notes_file: str, context,
 
 # ── Recording actions ──────────────────────────────────────────────────────
 
+def _handle_recording_start_failed(message: str):
+    global _status, _realtime_session
+    _status = "idle"
+    recorder.on_audio_chunk = None
+    recorder.on_mic_level = None
+    recorder.on_sys_level = None
+    recorder.on_start_failed = None
+
+    if _bridge:
+        _bridge.close_level_window()
+        _bridge.close_live_window()
+
+    if _realtime_session:
+        try:
+            _realtime_session.stop()
+        except Exception as e:
+            log.error(f"Failed to stop realtime session after recorder startup failure: {e}")
+        _realtime_session = None
+
+    if _tray_icon:
+        _tray_icon.icon = make_icon("idle")
+        _tray_icon.update_menu()
+
+    notify("MeetRec", message)
+
+
 def start_recording(icon, _item):
     global _status, _start_time, _realtime_session, _partial_transcript_path
     if _status != "idle":
@@ -560,6 +586,7 @@ def start_recording(icon, _item):
 
     recorder.on_mic_level = _level_bridge.update_mic
     recorder.on_sys_level = _level_bridge.update_sys
+    recorder.on_start_failed = _handle_recording_start_failed
     _bridge.open_level_window()
 
     threading.Thread(target=recorder.start, daemon=True).start()
@@ -574,6 +601,7 @@ def stop_recording(icon, _item):
     icon.icon = make_icon("idle")
     mp3 = recorder.stop()
     _last_mp3 = mp3
+    recorder.on_start_failed = None
 
     recorder.on_mic_level = None
     recorder.on_sys_level = None

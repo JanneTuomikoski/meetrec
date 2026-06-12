@@ -68,6 +68,7 @@ class Recorder:
         self.on_audio_chunk = None  # Callable[[bytes], None] for real-time streaming
         self.on_mic_level  = None   # Callable[[float], None] RMS level 0–1
         self.on_sys_level  = None   # Callable[[float], None] RMS level 0–1
+        self.on_start_failed = None
         self._stop_event   = threading.Event()
         self._chunks_lock  = threading.Lock()
         self._mic_chunks: list = []
@@ -78,8 +79,8 @@ class Recorder:
         self._mic_thread   = None   # kept to join before saving
         self._sys_thread   = None
 
-    def start(self):
-        """Begin recording. Blocks until stop() is called."""
+    def start(self) -> bool:
+        """Begin recording. Blocks until stop() is called. Returns False on startup failure."""
         os.makedirs(self.output_dir, exist_ok=True)
         self._stop_event.clear()
         self._mic_chunks = []
@@ -91,8 +92,14 @@ class Recorder:
             spk_name = self.speaker_name or sc.default_speaker().name
             loopback = sc.get_microphone(spk_name, include_loopback=True)
         except Exception as e:
-            log.error(f"Failed to open audio devices: {e}")
-            return
+            message = f"Failed to open audio devices: {e}"
+            log.error(message)
+            if self.on_start_failed:
+                try:
+                    self.on_start_failed(message)
+                except Exception as cb_error:
+                    log.error(f"Start-failure callback error: {cb_error}")
+            return False
 
         self._mic_rate = get_mic_samplerate(mic)
         self._sys_rate = get_sys_samplerate(loopback)
@@ -176,6 +183,7 @@ class Recorder:
         if self._mix_thread:
             self._mix_thread.join(timeout=3.0)
             self._mix_thread = None
+        return True
 
     def stop(self) -> str | None:
         """Stop recording, mix and save MP3. Returns path or None."""
