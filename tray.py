@@ -622,11 +622,19 @@ def _finish_recording(icon):
     if _realtime_session:
         _bridge.close_live_window()
         realtime_transcript = _realtime_session.stop()
+        session_had_error = _realtime_session.had_error
         _realtime_session = None
         if not realtime_transcript.strip():
             realtime_fallback = True
             realtime_transcript = None
             log.warning("Realtime transcript was empty; falling back to batch transcription.")
+        elif session_had_error:
+            # The stream dropped at some point, so the realtime transcript may
+            # be missing chunks of the meeting. The full audio is on disk —
+            # re-transcribe it in batch mode rather than ship partial notes.
+            realtime_fallback = True
+            realtime_transcript = None
+            log.warning("Realtime session had errors; re-transcribing the full recording in batch mode.")
 
     if not mp3:
         _status = "idle"
