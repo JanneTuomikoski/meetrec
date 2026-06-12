@@ -608,10 +608,15 @@ def stop_recording(icon, _item):
     _bridge.close_level_window()
 
     realtime_transcript = None
+    realtime_fallback = False
     if _realtime_session:
         _bridge.close_live_window()
         realtime_transcript = _realtime_session.stop()
         _realtime_session = None
+        if not realtime_transcript.strip():
+            realtime_fallback = True
+            realtime_transcript = None
+            log.warning("Realtime transcript was empty; falling back to batch transcription.")
 
     icon.update_menu()
 
@@ -624,7 +629,7 @@ def stop_recording(icon, _item):
         icon.icon = make_icon("processing")
         icon.update_menu()
         _bridge.show_context_and_transcribe_rt(mp3, realtime_transcript)
-    elif _auto_transcribe:
+    elif _auto_transcribe or realtime_fallback:
         _status = "processing"
         icon.icon = make_icon("processing")
         icon.update_menu()

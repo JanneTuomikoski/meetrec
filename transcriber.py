@@ -7,6 +7,7 @@ API keys loaded from .env. Accepts optional MeetingContext for richer notes.
 import os
 import time
 import threading
+from collections import deque
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -180,6 +181,8 @@ class RealtimeTranscriptionSession:
         self._connected = threading.Event()
         self._sample_rate = 16000
         self._stop_requested = False
+        self.had_error = False
+        self._pending_chunks = deque(maxlen=120)
 
     def _on_begin(self, _client, event):
         self._connected.set()
@@ -198,6 +201,7 @@ class RealtimeTranscriptionSession:
                 self.on_partial(event.transcript)
 
     def _on_error(self, _client, error):
+        self.had_error = True
         log.error(f"RealtimeTranscriber error: {error}")
         if not self._stop_requested:
             threading.Thread(target=self._reconnect, daemon=True).start()
@@ -231,16 +235,35 @@ class RealtimeTranscriptionSession:
         )
         self._client.connect(params=params)
         if not self._connected.wait(timeout=10.0):
+            self.had_error = True
             log.error("Streaming connection timed out after 10s")
 
     def start(self, sample_rate: int = 16000):
         self._sample_rate = sample_rate
         self._stop_requested = False
-        self._do_connect()
+        try:
+            self._do_connect()
+        except Exception as e:
+            self.had_error = True
+            log.error(f"RealtimeTranscriber start failed: {e}")
+            return
+        if self._stop_requested and self._client:
+            self._client.disconnect(terminate=True)
+            self._client = None
 
     def send_chunk(self, pcm_bytes: bytes):
-        if self._client and self._connected.is_set():
+        if not self._client or not self._connected.is_set():
+            self._pending_chunks.append(pcm_bytes)
+            return
+        try:
+            while self._pending_chunks:
+                self._client.stream(self._pending_chunks.popleft())
             self._client.stream(pcm_bytes)
+        except AttributeError:
+            pass  # _client cleared by stop() during this call — not an error
+        except Exception as e:
+            self.had_error = True
+            log.error(f"RealtimeTranscriber stream failed: {e}")
 
     def stop(self) -> str:
         self._stop_requested = True
@@ -248,6 +271,7 @@ class RealtimeTranscriptionSession:
             self._client.disconnect(terminate=True)
             self._client = None
         result = " ".join(self._finals)
+        self._pending_chunks.clear()
         log.info(f"Realtime transcription complete: {len(self._finals)} utterances")
         return result
 
