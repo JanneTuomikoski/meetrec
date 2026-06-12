@@ -158,8 +158,10 @@ class Recorder:
                     sys_c = np.zeros_like(mic_c)
                 min_len = min(len(mic_c), len(sys_c))
                 mixed = (mic_c[:min_len] * self.mic_boost) + (sys_c[:min_len] * self.sys_boost)
+                # Only attenuate when clipping — normalizing every chunk up to
+                # full scale would blast background noise during quiet passages.
                 peak = np.max(np.abs(mixed))
-                if peak > 0:
+                if peak > 1.0:
                     mixed = mixed / peak * 0.95
                 try:
                     self.on_audio_chunk((mixed * 32767).astype(np.int16).tobytes())
