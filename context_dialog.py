@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QComboBox,
-    QPushButton, QFrame, QSizePolicy
+    QPushButton, QFrame, QSizePolicy, QCheckBox
 )
 from PySide6.QtCore import Qt
 
@@ -120,29 +120,59 @@ QFrame#divider {
     background-color: #313244;
     max-height: 1px;
 }
+QCheckBox {
+    color: #cdd6f4;
+    font-size: 13px;
+    font-weight: 400;
+    spacing: 8px;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    background-color: #313244;
+}
+QCheckBox::indicator:checked {
+    background-color: #89b4fa;
+    border-color: #89b4fa;
+}
 """
 
 
 @dataclass
 class MeetingContext:
     title:          str = ""
-    participants:   str = ""
+    participants:   str = ""   # other participants when me_present, else everyone
     agenda:         str = ""
     language:       str = ""
     notes_language: str = "en"
     meeting_type:   str = "general"
+    my_name:        str = ""
+    me_present:     bool = True
+
+    @property
+    def mic_speaker(self) -> str:
+        """Name of whoever speaks into the microphone channel."""
+        if self.me_present:
+            return self.my_name
+        return self.participants.split(",")[0].strip()
+
+
+OPTIONAL_SUFFIX = "  <span style='color:#585b70;font-weight:400;text-transform:none'>optional</span>"
 
 
 class ContextDialog(QDialog):
-    def __init__(self, default_title: str = ""):
+    def __init__(self, default_title: str = "", my_name: str = ""):
         self._app = QApplication.instance() or QApplication(sys.argv)
 
         super().__init__()
         self.result_context: MeetingContext | None = None
+        self._my_name = my_name.strip()
         self._build_ui(default_title)
 
     def _field_label(self, text: str, optional: bool = True) -> QLabel:
-        suffix = "  <span style='color:#585b70;font-weight:400;text-transform:none'>optional</span>" if optional else ""
+        suffix = OPTIONAL_SUFFIX if optional else ""
         lbl = QLabel(f"{text}{suffix}")
         lbl.setTextFormat(Qt.RichText)
         lbl.setStyleSheet("color: #a6adc8; letter-spacing: 0.5px;")
@@ -188,11 +218,20 @@ class ContextDialog(QDialog):
         root.addSpacing(12)
 
         # ── Participants ──
-        root.addWidget(self._field_label("PARTICIPANTS"))
+        me_label = f"I'm in this meeting ({self._my_name})" if self._my_name else "I'm in this meeting"
+        self.me_checkbox = QCheckBox(me_label)
+        self.me_checkbox.setChecked(True)
+        self.me_checkbox.setCursor(Qt.PointingHandCursor)
+        self.me_checkbox.toggled.connect(self._update_participants_caption)
+        root.addWidget(self.me_checkbox)
+        root.addSpacing(8)
+
+        self.participants_label = self._field_label("OTHER PARTICIPANTS")
+        root.addWidget(self.participants_label)
         self.participants_input = QLineEdit()
-        self.participants_input.setPlaceholderText("e.g. Janne, Maria, Bob")
         self.participants_input.setFixedHeight(38)
         root.addWidget(self.participants_input)
+        self._update_participants_caption(True)
         root.addSpacing(12)
 
         # ── Agenda ──
@@ -257,6 +296,13 @@ class ContextDialog(QDialog):
         btn_row.addWidget(btn_ok)
         root.addLayout(btn_row)
 
+    def _update_participants_caption(self, me_checked: bool):
+        text = "OTHER PARTICIPANTS" if me_checked else "PARTICIPANTS"
+        self.participants_label.setText(f"{text}{OPTIONAL_SUFFIX}")
+        placeholder = ("e.g. Maria, Bob" if me_checked
+                       else "e.g. Maria, Bob — first name is the mic speaker")
+        self.participants_input.setPlaceholderText(placeholder)
+
     def _on_ok(self):
         self.result_context = MeetingContext(
             title          = self.title_input.text().strip(),
@@ -265,11 +311,14 @@ class ContextDialog(QDialog):
             language       = self.lang_combo.currentData(),
             notes_language = self.notes_lang_combo.currentData(),
             meeting_type   = self.meeting_type_combo.currentData(),
+            my_name        = self._my_name,
+            me_present     = self.me_checkbox.isChecked(),
         )
         self.accept()
 
     def _on_skip(self):
-        self.result_context = MeetingContext()
+        # Even without details, the configured name still labels the mic channel
+        self.result_context = MeetingContext(my_name=self._my_name)
         self.accept()
 
     def _on_cancel(self):
@@ -277,9 +326,9 @@ class ContextDialog(QDialog):
         self.reject()
 
 
-def ask_meeting_context(default_title: str = "") -> MeetingContext | None:
+def ask_meeting_context(default_title: str = "", my_name: str = "") -> MeetingContext | None:
     """Show the context dialog and return MeetingContext, or None if cancelled."""
-    dlg = ContextDialog(default_title=default_title)
+    dlg = ContextDialog(default_title=default_title, my_name=my_name)
     dlg.exec()
     return dlg.result_context
 

@@ -19,7 +19,7 @@ import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageDraw
 
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QLineEdit
 from PySide6.QtCore import QObject, Signal, Qt
 
 from recorder import Recorder, list_microphones, list_speakers
@@ -56,6 +56,7 @@ _last_mp3              = None
 _auto_transcribe       = False
 _realtime_mode         = False
 _obsidian_vault: str | None = None
+_my_name               = ""
 _realtime_session      = None   # RealtimeTranscriptionSession | None
 _partial_transcript_path: str | None = None
 _stop_tooltip          = threading.Event()
@@ -64,11 +65,11 @@ _stop_tooltip          = threading.Event()
 # ── Settings persistence ───────────────────────────────────────────────────
 
 def _load_settings():
-    global _auto_transcribe, _realtime_mode, _obsidian_vault
+    global _auto_transcribe, _realtime_mode, _obsidian_vault, _my_name
     try:
         if SETTINGS_FILE.exists():
             s = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            _auto_transcribe, _realtime_mode, _obsidian_vault = apply_settings(s, recorder)
+            _auto_transcribe, _realtime_mode, _obsidian_vault, _my_name = apply_settings(s, recorder)
             log.info("Settings loaded")
     except Exception as e:
         log.error(f"Failed to load settings: {e}")
@@ -76,7 +77,7 @@ def _load_settings():
 
 def _save_settings():
     try:
-        payload = settings_payload(_auto_transcribe, _realtime_mode, recorder, _obsidian_vault)
+        payload = settings_payload(_auto_transcribe, _realtime_mode, recorder, _obsidian_vault, _my_name)
         SETTINGS_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception as e:
         log.error(f"Failed to save settings: {e}")
@@ -192,6 +193,7 @@ class UIBridge(QObject):
 
     _request_file_pick       = Signal()
     _request_vault_pick      = Signal()
+    _request_name_input      = Signal()
     _request_context         = Signal(str)        # mp3 path
     _request_context_rt      = Signal(str, str)   # mp3 path, realtime transcript
     _request_transcript_pick = Signal()
@@ -206,6 +208,7 @@ class UIBridge(QObject):
         super().__init__()
         self._request_file_pick.connect(self._do_file_pick)
         self._request_vault_pick.connect(self._do_vault_pick)
+        self._request_name_input.connect(self._do_name_input)
         self._request_context.connect(self._do_show_context)
         self._request_context_rt.connect(self._do_show_context_rt)
         self._request_transcript_pick.connect(self._do_transcript_pick)
@@ -231,6 +234,9 @@ class UIBridge(QObject):
 
     def pick_obsidian_vault(self):
         self._request_vault_pick.emit()
+
+    def ask_my_name(self):
+        self._request_name_input.emit()
 
     def show_context_and_transcribe(self, mp3_path: str):
         self._request_context.emit(mp3_path)
@@ -316,7 +322,7 @@ class UIBridge(QObject):
     def _run_notes_flow(self, transcript_path: str):
         global _status
         stem = Path(transcript_path).stem.replace("_transcript", "").replace("meeting_", "").replace("_", " ")
-        context = ask_meeting_context(default_title=stem)
+        context = ask_meeting_context(default_title=stem, my_name=_my_name)
 
         if context is None:
             log.info("Notes regeneration cancelled by user.")
@@ -344,6 +350,23 @@ class UIBridge(QObject):
             daemon=True,
         ).start()
 
+    def _do_name_input(self):
+        global _my_name
+        name, ok = QInputDialog.getText(
+            None,
+            "MeetRec — My Name",
+            "Your name (used to label your voice in transcripts):",
+            QLineEdit.Normal,
+            _my_name,
+            Qt.WindowStaysOnTopHint,
+        )
+        if ok:
+            _my_name = name.strip()
+            _save_settings()
+            log.info(f"My name set to: {_my_name or '(cleared)'}")
+            if _tray_icon:
+                _tray_icon.update_menu()
+
     def _do_vault_pick(self):
         global _obsidian_vault
         start = _obsidian_vault or str(Path.home())
@@ -364,7 +387,7 @@ class UIBridge(QObject):
     def _run_context_flow(self, mp3_path: str, realtime_transcript: str | None = None):
         global _status
         stem    = Path(mp3_path).stem.replace("meeting_", "").replace("_", " ")
-        context = ask_meeting_context(default_title=stem)
+        context = ask_meeting_context(default_title=stem, my_name=_my_name)
 
         if context is None:
             log.info("Transcription cancelled by user.")
@@ -746,6 +769,10 @@ def toggle_realtime_mode(icon, _item):
     icon.update_menu()
 
 
+def set_my_name(icon, _item):
+    _bridge.ask_my_name()
+
+
 # ── Device selection ───────────────────────────────────────────────────────
 
 def set_mic(name):
@@ -927,6 +954,8 @@ def settings_submenu():
              toggle_auto_transcribe),
         item(lambda _: f"⚡  Live transcription  {'✔' if _realtime_mode else ''}",
              toggle_realtime_mode),
+        item(lambda _: (f"👤  My name  {_my_name}" if _my_name else "👤  My name…"),
+             set_my_name),
         pystray.Menu.SEPARATOR,
         item("🎙️  Microphone", pystray.Menu(mic_submenu)),
         item("🔊  Loopback",   pystray.Menu(spk_submenu)),

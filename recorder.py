@@ -15,10 +15,10 @@ import queue
 import os
 
 from logger import log
-from audio_mix import mix_mono_tracks
+from audio_mix import stereo_tracks
 
 CHUNK_DURATION = 0.5    # seconds per read chunk
-OUTPUT_RATE    = 16000  # 16k mono is ideal for AssemblyAI
+OUTPUT_RATE    = 16000  # 16k is ideal for AssemblyAI
 
 
 def list_microphones() -> list[str]:
@@ -188,7 +188,8 @@ class Recorder:
         return True
 
     def stop(self) -> str | None:
-        """Stop recording, mix and save MP3. Returns path or None."""
+        """Stop recording and save a stereo MP3 (mic left, system right).
+        Returns path or None."""
         self._stop_event.set()
         # Wait for recording threads to finish their current read before touching chunks
         for t in (self._mic_thread, self._sys_thread):
@@ -213,8 +214,8 @@ class Recorder:
             mic_rs = _resample(mic_mono, self._mic_rate, OUTPUT_RATE) if mic_mono is not None else None
             sys_rs = _resample(sys_mono, self._sys_rate, OUTPUT_RATE) if sys_mono is not None else None
 
-            mixed = mix_mono_tracks(mic_rs, sys_rs, self.mic_boost, self.sys_boost)
-            if mixed is None:
+            stereo = stereo_tracks(mic_rs, sys_rs, self.mic_boost, self.sys_boost)
+            if stereo is None:
                 log.warning("Recording stopped but no mixable audio was captured.")
                 return None
 
@@ -222,7 +223,7 @@ class Recorder:
             temp_wav  = os.path.join(self.output_dir, f"meeting_{timestamp}_temp.wav")
             mp3_path  = os.path.join(self.output_dir, f"meeting_{timestamp}.mp3")
 
-            sf.write(temp_wav, mixed, OUTPUT_RATE)
+            sf.write(temp_wav, stereo, OUTPUT_RATE)
 
             encode_error = ""
             try:
@@ -242,7 +243,7 @@ class Recorder:
 
             log.warning(f"MP3 encoding failed ({encode_error})")
             flac_path = mp3_path.replace('.mp3', '.flac')
-            sf.write(flac_path, mixed, OUTPUT_RATE, format='FLAC', subtype='PCM_16')
+            sf.write(flac_path, stereo, OUTPUT_RATE, format='FLAC', subtype='PCM_16')
             os.remove(temp_wav)
             log.info(f"Recording saved (FLAC fallback): {flac_path}")
             return flac_path

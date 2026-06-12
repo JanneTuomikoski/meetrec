@@ -3,14 +3,19 @@ from types import SimpleNamespace
 
 try:
     import numpy as np
-    from audio_mix import mix_mono_tracks
+    from audio_mix import stereo_tracks
 except ModuleNotFoundError:
     np = None
-    mix_mono_tracks = None
+    stereo_tracks = None
 
 from filenames import obsidian_filename
 from notes import build_notes
 from settings_store import apply_settings, settings_payload
+
+try:
+    from context_dialog import MeetingContext
+except ModuleNotFoundError:
+    MeetingContext = None
 
 
 class FilenameTests(unittest.TestCase):
@@ -39,14 +44,15 @@ class SettingsTests(unittest.TestCase):
             mic_boost=1.5,
             sys_boost=0.8,
         )
-        payload = settings_payload(True, False, recorder, "C:/Vault")
+        payload = settings_payload(True, False, recorder, "C:/Vault", "Janne")
 
         target = SimpleNamespace()
-        auto, realtime, vault = apply_settings(payload, target)
+        auto, realtime, vault, my_name = apply_settings(payload, target)
 
         self.assertTrue(auto)
         self.assertFalse(realtime)
         self.assertEqual(vault, "C:/Vault")
+        self.assertEqual(my_name, "Janne")
         self.assertEqual(target.mic_name, "Mic")
         self.assertEqual(target.speaker_name, "Speaker")
         self.assertEqual(target.mic_boost, 1.5)
@@ -87,21 +93,41 @@ class NotesTests(unittest.TestCase):
         self.assertEqual(notes, "# Weekly\n\nbetter notes")
 
 
+class MeetingContextTests(unittest.TestCase):
+    @unittest.skipIf(MeetingContext is None, "PySide6 is not installed")
+    def test_mic_speaker_is_my_name_when_present(self):
+        context = MeetingContext(participants="Maria, Bob", my_name="Janne", me_present=True)
+        self.assertEqual(context.mic_speaker, "Janne")
+
+    @unittest.skipIf(MeetingContext is None, "PySide6 is not installed")
+    def test_mic_speaker_is_first_participant_when_not_present(self):
+        context = MeetingContext(participants="Maria, Bob", my_name="Janne", me_present=False)
+        self.assertEqual(context.mic_speaker, "Maria")
+
+    @unittest.skipIf(MeetingContext is None, "PySide6 is not installed")
+    def test_mic_speaker_empty_without_names(self):
+        self.assertEqual(MeetingContext(me_present=False).mic_speaker, "")
+
+
 class AudioMixTests(unittest.TestCase):
     @unittest.skipIf(np is None, "numpy is not installed")
-    def test_mixing_preserves_longer_system_tail(self):
+    def test_tracks_stay_on_separate_channels(self):
         mic = np.array([1.0, 1.0], dtype=np.float32)
         system = np.array([0.0, 0.0, 0.5, 0.5], dtype=np.float32)
 
-        mixed = mix_mono_tracks(mic, system, mic_boost=1.0, sys_boost=1.0)
+        stereo = stereo_tracks(mic, system, mic_boost=1.0, sys_boost=1.0)
 
-        self.assertEqual(len(mixed), 4)
-        self.assertGreater(mixed[2], 0)
-        self.assertGreater(mixed[3], 0)
+        self.assertEqual(stereo.shape, (4, 2))
+        # Mic only on the left channel, padded with silence after it ends
+        self.assertGreater(stereo[0, 0], 0)
+        self.assertEqual(stereo[2, 0], 0)
+        # System only on the right channel
+        self.assertEqual(stereo[0, 1], 0)
+        self.assertGreater(stereo[2, 1], 0)
 
     @unittest.skipIf(np is None, "numpy is not installed")
     def test_mixing_returns_none_without_audio(self):
-        self.assertIsNone(mix_mono_tracks(None, None, 1.0, 1.0))
+        self.assertIsNone(stereo_tracks(None, None, 1.0, 1.0))
 
 
 if __name__ == "__main__":

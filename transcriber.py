@@ -12,6 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 import assemblyai as aai
+import soundfile as sf
 from assemblyai.streaming.v3 import (
     StreamingClient,
     StreamingClientOptions,
@@ -80,14 +81,31 @@ MEETING_PROMPTS = {
 }
 
 
-def transcribe_with_speakers(mp3_path: str, language: str = "") -> str:
+def _channel_count(audio_path: str) -> int:
+    try:
+        return sf.info(audio_path).channels
+    except Exception as e:
+        log.warning(f"Could not probe channel count ({e}); assuming mono")
+        return 1
+
+
+def transcribe_with_speakers(mp3_path: str, language: str = "", mic_speaker: str = "") -> str:
     aai.settings.api_key = ASSEMBLYAI_API_KEY
     log.info(f"Uploading to AssemblyAI: {mp3_path}")
+
+    # Recordings made by MeetRec are stereo with the mic on channel 1 and
+    # system audio on channel 2, so the mic channel identifies the local
+    # speaker with certainty. Mono files (older recordings, external audio)
+    # fall back to plain diarization.
+    multichannel = _channel_count(mp3_path) >= 2
 
     config_kwargs = dict(
         speech_models=["universal-3-pro", "universal-2"],
         speaker_labels=True,
     )
+    if multichannel:
+        config_kwargs["multichannel"] = True
+        log.info(f"Multichannel transcription | mic channel = {mic_speaker or 'unnamed'}")
     if language:
         config_kwargs["language_code"] = language
         log.info(f"Language hint: {language}")
@@ -106,10 +124,14 @@ def transcribe_with_speakers(mp3_path: str, language: str = "") -> str:
     log.info(f"Transcription complete: {len(transcript.utterances)} utterances")
 
     lines = []
-    for utt in transcript.utterances:
+    for utt in sorted(transcript.utterances, key=lambda u: u.start):
         minutes = int(utt.start / 60000)
         seconds = int((utt.start % 60000) / 1000)
-        lines.append(f"[{minutes:02d}:{seconds:02d}] Speaker {utt.speaker}: {utt.text}")
+        if multichannel and str(getattr(utt, "channel", "")) == "1":
+            label = mic_speaker or "Me (mic)"
+        else:
+            label = f"Speaker {utt.speaker}"
+        lines.append(f"[{minutes:02d}:{seconds:02d}] {label}: {utt.text}")
 
     return "\n".join(lines)
 
@@ -124,8 +146,11 @@ def generate_notes(raw_text: str, context=None, existing_notes: str = "") -> str
         parts = []
         if context.title:
             parts.append(f"Meeting title: {context.title}")
-        if context.participants:
-            parts.append(f"Participants: {context.participants}")
+        participants = context.participants
+        if getattr(context, "me_present", False) and getattr(context, "my_name", ""):
+            participants = f"{context.my_name}, {participants}" if participants else context.my_name
+        if participants:
+            parts.append(f"Participants: {participants}")
         if context.agenda:
             parts.append(f"Topic / agenda: {context.agenda}")
         if parts:
@@ -149,9 +174,24 @@ Please improve and refine the existing notes based on the full transcript. Fix a
     else:
         meeting_type = (context.meeting_type if context and hasattr(context, "meeting_type") else None) or "general"
         structure = MEETING_PROMPTS.get(meeting_type, MEETING_PROMPTS["general"])
+        mic_speaker = getattr(context, "mic_speaker", "") if context else ""
+        if mic_speaker:
+            speaker_note = (
+                f"Speakers already named in the transcript (e.g. {mic_speaker}) were identified "
+                f"from their own microphone channel — that attribution is certain, never reassign "
+                f"those lines. Speakers labeled A, B, C were detected automatically; map them to "
+                f"the remaining participant names from the context above when confident, otherwise "
+                f"keep the generic label rather than guessing."
+            )
+        else:
+            speaker_note = (
+                "Speakers are labeled A, B, C etc. Use participant names from the context above "
+                "wherever possible instead of Speaker A/B/C; if you cannot confidently match a "
+                "speaker to a name, keep the generic label rather than guessing."
+            )
         prompt = f"""You are an expert meeting note-taker. Write all notes in {notes_lang}. {structure}
 
-{context_block}Speakers are labeled A, B, C etc. Use participant names from the context above wherever possible instead of Speaker A/B/C.
+{context_block}{speaker_note}
 
 Transcript:
 {raw_text}"""
@@ -301,8 +341,9 @@ def process_meeting(mp3_path: str, transcript_dir: str, notes_dir: str, context=
     transcript_file = os.path.join(transcript_dir, f"{stem}_transcript.txt")
     notes_file      = os.path.join(notes_dir,      f"{stem}_notes.md")
 
-    language = context.language if context else ""
-    raw_text = transcribe_with_speakers(mp3_path, language=language)
+    language    = context.language if context else ""
+    mic_speaker = getattr(context, "mic_speaker", "") if context else ""
+    raw_text = transcribe_with_speakers(mp3_path, language=language, mic_speaker=mic_speaker)
 
     with open(transcript_file, "w", encoding="utf-8") as f:
         f.write(raw_text)

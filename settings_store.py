@@ -6,7 +6,7 @@ DEFAULT_MIC_BOOST = 1.3
 DEFAULT_SYS_BOOST = 0.8
 
 
-def settings_payload(auto_transcribe, realtime_mode, recorder, obsidian_vault):
+def settings_payload(auto_transcribe, realtime_mode, recorder, obsidian_vault, my_name=""):
     return {
         "auto_transcribe": auto_transcribe,
         "realtime_mode": realtime_mode,
@@ -15,6 +15,7 @@ def settings_payload(auto_transcribe, realtime_mode, recorder, obsidian_vault):
         "mic_boost": recorder.mic_boost,
         "sys_boost": recorder.sys_boost,
         "obsidian_vault": obsidian_vault,
+        "my_name": my_name,
     }
 
 
@@ -27,4 +28,5 @@ def apply_settings(settings, recorder):
         settings.get("auto_transcribe", DEFAULT_AUTO_TRANSCRIBE),
         settings.get("realtime_mode", DEFAULT_REALTIME_MODE),
         settings.get("obsidian_vault"),
+        settings.get("my_name", ""),
     )
